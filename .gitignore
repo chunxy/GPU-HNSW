@@ -1,0 +1,9 @@
+.vscode/
+build/
+checkpoints/
+logs/
+.breakpoints
+.variables
+angle.cu
+compile.sh
+run.sh

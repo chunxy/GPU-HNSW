@@ -1,0 +1,18 @@
+BasedOnStyle: Google
+DerivePointerAlignment: false
+PointerAlignment: Right
+ColumnLimit: 120
+
+# Default for clang-8, changed in later clangs. Set explicitly for forwards
+# compatibility for students with modern clangs
+IncludeBlocks: Preserve
+
+# https://stackoverflow.com/questions/50689027/get-clang-format-to-put-closing-parenthesis-of-multiline-function-calls-on-separ
+# AlignAfterOpenBracket: BlockIndent
+
+# https://stackoverflow.com/questions/50318053/clang-format-force-each-argument-parameter-to-own-line-when-column-exceeded
+BinPackArguments: false
+BinPackParameters: false
+AlignAfterOpenBracket: AlwaysBreak
+IndentCaseLabels: true
+AllowAllParametersOfDeclarationOnNextLine: false

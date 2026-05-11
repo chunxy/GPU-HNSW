@@ -1,0 +1,6 @@
+add_subdirectory(impl)
+link_libraries(IMPL)
+add_subdirectory(benchs)
+if(BUILD_TESTING)
+  add_subdirectory(test)
+endif()

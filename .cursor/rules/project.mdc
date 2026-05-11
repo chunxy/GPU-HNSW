@@ -1,0 +1,25 @@
+---
+description: Guidance for GPU HNSW build logic, architecture, and kernel workflow in this repository
+globs: src/**/*.cu, src/**/*.cpp, include/**/*.h, include/**/*.cuh, include/**/*.hpp, CMakeLists.txt, src/CMakeLists.txt, run.sh
+alwaysApply: false
+---
+
+## Tech Stack
+
+- C++ (17+)
+- Boost
+- CUDA
+- Python
+
+## Core Logic
+
+The purpose of this project is to accelerate the HNSW proximity graph vector index construction with GPU. The core idea is reflected in @kernel.cuh and @kernel.cu, particularly the `build_graph_kernel` function.
+
+Here is its main logic:
+
+1. compute the distances between new batch with a middle level of old of a moderate size; compute the distances between new vectors for future use
+2. connect new vectors to old vectors as well as add the reverse edges starting from the middle level to the upper-most level of each new vector
+3. search for old vectors in the lower levels starting from the middle level, connect new to old as well as add the reverse edges during the process
+4. prune for new vectors on each level, taking into consideration the old vectors already connected as well as the new vectors inserted
+5. prune for the old vectors
+6. move on to next batch of new vectors

@@ -1,0 +1,22 @@
+CompileFlags:
+  Add: [
+    "-x", "cuda",
+    "-std=c++17",
+    "-I/home/sean/GpuHnsw/include",
+    # Match your CMake arch (CMAKE_CUDA_ARCHITECTURES 89)
+    "--cuda-gpu-arch=sm_89",
+
+    # Point this at your CUDA install if clangd can’t auto-detect
+    "--cuda-path=/usr/local/cuda-12.3",
+
+  ]
+  Remove: ["-fopenmp",
+    "-forward-unknown-to-host-compiler",
+    "--options-file",
+    "-arch=native",
+    "--generate-code=arch=compute_89,code=[compute_89,sm_89]",
+    "-Xcompiler=-fPIC",
+    "-Xcompiler=-fvisibility=hidden",
+    "-rdc=true",
+    "-G",
+  ]
