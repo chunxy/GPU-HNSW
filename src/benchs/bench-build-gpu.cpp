@@ -44,13 +44,10 @@ int main(int argc, char **argv) {
   cudaDeviceSynchronize();
   std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
   std::chrono::duration<double> duration = end - start;
-  index.copy_from_gpu();
-  index.saveIndex(index_path);
-
   fmt::print("Build time: {:.2f} seconds\n", duration.count());
 
-  time_t ts = time(nullptr);
-  auto tm = localtime(&ts);
+  index.copy_from_gpu();
+  index.saveIndex(index_path);
 
   return 0;
 }

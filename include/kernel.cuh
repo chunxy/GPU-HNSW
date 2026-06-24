@@ -55,7 +55,7 @@ struct GpuGraphState {
   float *vector_powers{nullptr};
   float *news_dist{nullptr};
   uint32_t *news_rank{nullptr};
-  bool *visited{nullptr};
+  uint32_t *visited{nullptr};
   uint32_t *frozen_link_counts{nullptr};
 };
 

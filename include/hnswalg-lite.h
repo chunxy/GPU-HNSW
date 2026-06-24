@@ -1,6 +1,7 @@
 #pragma once
 
 #include <assert.h>
+#include <chrono>
 #include <cuda_runtime.h>
 #include <fmt/core.h>
 #include <stdlib.h>
@@ -1081,12 +1082,12 @@ class HierarchicalNswLite {
           __FILE__,
           __LINE__);
       cudaCheck(
-          cudaMalloc(&(host_gpu_graph_state_.visited), sizeof(bool) * gpu_max_elements * GRID_DIM),
+          cudaMalloc(&(host_gpu_graph_state_.visited), sizeof(uint32_t) * gpu_max_elements * GRID_DIM),
           "cudaMalloc",
           __FILE__,
           __LINE__);
       cudaCheck(
-          cudaMemset(host_gpu_graph_state_.visited, 0, sizeof(bool) * gpu_max_elements * GRID_DIM),
+          cudaMemset(host_gpu_graph_state_.visited, 0, sizeof(uint32_t) * gpu_max_elements * GRID_DIM),
           "cudaMemset",
           __FILE__,
           __LINE__);
@@ -1298,10 +1299,29 @@ class HierarchicalNswLite {
     // // Initialize the vectors and the graph state.
     // move_to_gpu();
 
-    // compute the powers, generate the random levels, and convert to half precision
-    cudaCheck(launch_prepare_graph_kernel(device_gpu_graph_state_), "launch_prepare_graph_kernel", __FILE__, __LINE__);
+    cudaEvent_t ev_prepare_start = nullptr;
+    cudaEvent_t ev_prepare_end = nullptr;
+    cudaEvent_t ev_build_start = nullptr;
+    cudaEvent_t ev_build_end = nullptr;
+    cudaCheck(cudaEventCreate(&ev_prepare_start), "cudaEventCreate", __FILE__, __LINE__);
+    cudaCheck(cudaEventCreate(&ev_prepare_end), "cudaEventCreate", __FILE__, __LINE__);
+    cudaCheck(cudaEventCreate(&ev_build_start), "cudaEventCreate", __FILE__, __LINE__);
+    cudaCheck(cudaEventCreate(&ev_build_end), "cudaEventCreate", __FILE__, __LINE__);
 
-    // assign the link lists for GPU
+    // compute the powers, generate the random levels, and convert to half precision
+    cudaCheck(cudaEventRecord(ev_prepare_start), "cudaEventRecord", __FILE__, __LINE__);
+    cudaCheck(launch_prepare_graph_kernel(device_gpu_graph_state_), "launch_prepare_graph_kernel", __FILE__, __LINE__);
+    cudaCheck(cudaEventRecord(ev_prepare_end), "cudaEventRecord", __FILE__, __LINE__);
+    cudaCheck(cudaEventSynchronize(ev_prepare_end), "cudaEventSynchronize", __FILE__, __LINE__);
+    float ms_prepare = 0.0f;
+    cudaCheck(
+        cudaEventElapsedTime(&ms_prepare, ev_prepare_start, ev_prepare_end),
+        "cudaEventElapsedTime",
+        __FILE__,
+        __LINE__);
+
+    // assign the link lists for GPU (host wall time: D2H + cudaMalloc/cudaMemset + pointer table H2D)
+    const auto alloc_t0 = std::chrono::steady_clock::now();
     cudaCheck(
         cudaMemcpy(
             element_levels_.data(),
@@ -1329,8 +1349,32 @@ class HierarchicalNswLite {
         "cudaMemcpy",
         __FILE__,
         __LINE__);
+    const auto alloc_t1 = std::chrono::steady_clock::now();
+    const double ms_alloc =
+        std::chrono::duration<double, std::milli>(alloc_t1 - alloc_t0).count();
 
+    cudaCheck(cudaEventRecord(ev_build_start), "cudaEventRecord", __FILE__, __LINE__);
     cudaCheck(launch_build_graph_kernel(device_gpu_graph_state_), "launch_build_graph_kernel", __FILE__, __LINE__);
+    cudaCheck(cudaEventRecord(ev_build_end), "cudaEventRecord", __FILE__, __LINE__);
+    cudaCheck(cudaEventSynchronize(ev_build_end), "cudaEventSynchronize", __FILE__, __LINE__);
+    float ms_build = 0.0f;
+    cudaCheck(
+        cudaEventElapsedTime(&ms_build, ev_build_start, ev_build_end),
+        "cudaEventElapsedTime",
+        __FILE__,
+        __LINE__);
+
+    cudaCheck(cudaEventDestroy(ev_prepare_start), "cudaEventDestroy", __FILE__, __LINE__);
+    cudaCheck(cudaEventDestroy(ev_prepare_end), "cudaEventDestroy", __FILE__, __LINE__);
+    cudaCheck(cudaEventDestroy(ev_build_start), "cudaEventDestroy", __FILE__, __LINE__);
+    cudaCheck(cudaEventDestroy(ev_build_end), "cudaEventDestroy", __FILE__, __LINE__);
+
+    fmt::print(
+        "build_graph_gpu timing: prepare_graph_kernel {:.3f} ms, link_list alloc/setup {:.3f} ms, "
+        "build_graph_kernel {:.3f} ms\n",
+        ms_prepare,
+        ms_alloc,
+        ms_build);
 
     // // copy back to CPU
     // cudaCheck(cudaDeviceSynchronize(), "cudaDeviceSynchronize", __FILE__, __LINE__);

@@ -175,13 +175,13 @@ __device__ void bitonic_sort_id_by_dis(GpuGraphState *state) {
 }
 
 __device__ void bitonic_sort_id_for_ll(GpuGraphState *state) {
-  for (int i = blockIdx.x; i < state->cur_element_count; i += gridDim.x) {
-    for (int lv = 0; lv <= state->element_levels[i]; lv++) {
-      uint32_t *linkl = lv == 0 ? get_linklist0(state, i) : get_linklist(state, i, lv);
+  for (int vid = blockIdx.x; vid < state->cur_element_count; vid += gridDim.x) {
+    for (int lv = 0; lv <= state->element_levels[vid]; lv++) {
+      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
       uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, i) : (float *)get_linklist_dist(state, i, lv);
+      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
       int len = getListCount(linkl);
-      if (len <= 1) continue;
+      if (len <= 1 || len == get_frozen_link_count(state, vid, lv)) continue;
 
       const unsigned tid = threadIdx.x;
       const unsigned sort_len = next_power_of_two(len);
@@ -1151,6 +1151,8 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
       uint32_t *datal = (uint32_t *)(linkl + 1);
       float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
       int sz = getListCount(linkl);
+      if (sz == get_frozen_link_count(state, vid, lv)) continue;
+
       if (sz > M) {
         if (threadIdx.x == 0) {
           prev_neigh_rank = 0;
@@ -1233,7 +1235,8 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
 // 1 block for 1 new vector
 // threads for distance computation
 __device__ void search_knn_kernel(GpuGraphState *state, int startup_lv) {
-  __shared__ bool *visited;
+  __shared__ uint32_t *visited;
+  __shared__ uint32_t visited_tag;
   __shared__ Neighbor candq[CANDQ_SZ];
   __shared__ int candq_sz;
   __shared__ Neighbor topq[TOPQ_SZ];
@@ -1264,6 +1267,9 @@ __device__ void search_knn_kernel(GpuGraphState *state, int startup_lv) {
       curr_obj_shared = ranks[0];
       curr_dist_bits_shared = __float_as_int(dists[0]);
       visited = state->visited + blockIdx.x * state->max_elements;
+      if (bid == blockIdx.x) {
+        visited_tag = 0;
+      }
     }
     __syncthreads();
     int lv = startup_lv - 1;
@@ -1323,9 +1329,7 @@ __device__ void search_knn_kernel(GpuGraphState *state, int startup_lv) {
 #ifndef NDEBUG
         printf("Run to here: %s %d, Vector %d, Level %d\n", __FILE__, __LINE__, vid, lv);
 #endif
-      }
-      for (int i = threadIdx.x; i < state->max_elements; i += blockDim.x) {
-        visited[i] = 0;
+        ++visited_tag;
       }
       __syncthreads();
 
@@ -1343,7 +1347,7 @@ __device__ void search_knn_kernel(GpuGraphState *state, int startup_lv) {
 
         Neighbor tmp{candq[0].distance, candq[0].nodeid, candq[0].checked};
         if (threadIdx.x == 0) {
-          visited[tmp.nodeid] = 1;
+          atomicExch(&visited[tmp.nodeid], visited_tag);
           candq[0] = candq[candq_sz - 1];
           candq_sz--;
         }
@@ -1360,16 +1364,14 @@ __device__ void search_knn_kernel(GpuGraphState *state, int startup_lv) {
             assert(false);
           }
 #endif
-          bool already_visited = 0;
+          uint32_t prev_tag = 0;
           if (tx == 0) {
-            // already_visited = atomicExch((char *)&visited[cand], 1);
-            already_visited = visited[cand];
+            prev_tag = atomicExch(&visited[cand], visited_tag);
           }
-          already_visited = __shfl_sync(0xffffffff, already_visited, 0);
-          if (already_visited) {
+          prev_tag = __shfl_sync(0xffffffff, prev_tag, 0);
+          if (prev_tag == visited_tag) {
             continue;
           }
-          visited[cand] = 1;
           float dist = 0.0f;
           for (int j = tx; j < DIM; j += warpSize) {
             dist +=
