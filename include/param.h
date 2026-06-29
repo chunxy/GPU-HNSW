@@ -3,14 +3,14 @@ const int MAX_VISITED = 1000000;
 #ifndef NDEBUG
 const int GRID_DIM = 32;
 #else
-const int GRID_DIM = 64;
+const int GRID_DIM = 32;
 #endif
 
 const int BLOCK_DIM = 64;
 
-const int BATCHSZ_PER_NEW = 128;
+const int BATCHSZ_PER_NEW = 256;
 
-const int BATCHSZ_PER_OLD = 16;
+const int BATCHSZ_PER_OLD = 32;
 
 const int LEVEL_SZ_THRES = 1024;
 
