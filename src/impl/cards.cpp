@@ -87,6 +87,7 @@ DataCard gist{
     gist_gpath,
     960,
     10000,
+    1'000'000,
     100,
 };
 
@@ -96,6 +97,7 @@ DataCard crawl{
     crawl_qpath,
     crawl_gpath,
     128,
+    1'989'995,
     10000,
     100,
 };
@@ -106,26 +108,29 @@ DataCard glove100{
     glove100_qpath,
     glove100_gpath,
     128,
+    1'183'514,
     10000,
     100,
 };
 
 DataCard audio_dedup{
     "audio-dedup",
-    audio_bpath,
-    audio_qpath,
-    audio_gpath,
+    audio_dedup_bpath,
+    audio_dedup_qpath,
+    audio_dedup_gpath,
     128,
+    1'000'000,
     10000,
     100,
 };
 
 DataCard video_dedup{
     "video-dedup",
-    video_bpath,
-    video_qpath,
-    video_gpath,
-    128,
+    video_dedup_bpath,
+    video_dedup_qpath,
+    video_dedup_gpath,
+    1024,
+    1'000'000,
     10000,
     100,
 };
@@ -136,6 +141,7 @@ DataCard sift_dedup{
     sift_dedup_qpath,
     sift_dedup_gpath,
     128,
+    1'000'000 - 14538,
     10000,
     100,
 };
@@ -146,6 +152,7 @@ DataCard gist_dedup{
     gist_dedup_qpath,
     gist_dedup_gpath,
     128,
+    1'000'000 - 17306,
     10000,
     100,
 };
