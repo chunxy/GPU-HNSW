@@ -1,11 +1,11 @@
 #pragma once
 
 #include <assert.h>
-#include <chrono>
 #include <cuda_runtime.h>
 #include <fmt/core.h>
 #include <stdlib.h>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -253,6 +253,8 @@ class HierarchicalNswLite {
       gpu_free_fn_(host_gpu_graph_state_.news_dist);
       gpu_free_fn_(host_gpu_graph_state_.news_rank);
       gpu_free_fn_(host_gpu_graph_state_.frozen_link_counts);
+      gpu_free_fn_(host_gpu_graph_state_.changed_old_links);
+      gpu_free_fn_(host_gpu_graph_state_.changed_old_link_counts);
       gpu_free_fn_(device_gpu_graph_state_);
       // gpu_free_fn_(host_gpu_graph_state_.half_vector_data_);
     }
@@ -1101,6 +1103,23 @@ class HierarchicalNswLite {
           "cudaMemset",
           __FILE__,
           __LINE__);
+      cudaCheck(
+          cudaMalloc(
+              &host_gpu_graph_state_.changed_old_links,
+              sizeof(uint32_t) * static_cast<size_t>(BATCHSZ_PER_NEW) * MAX_HNSW_LEVEL * static_cast<size_t>(maxM0_)),
+          "cudaMalloc",
+          __FILE__,
+          __LINE__);
+      cudaCheck(
+          cudaMalloc(&host_gpu_graph_state_.changed_old_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL),
+          "cudaMalloc",
+          __FILE__,
+          __LINE__);
+      cudaCheck(
+          cudaMemset(host_gpu_graph_state_.changed_old_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL),
+          "cudaMemset",
+          __FILE__,
+          __LINE__);
 
       if (old_new_distances_count == 0) {
         host_gpu_graph_state_.news_dist = nullptr;
@@ -1227,10 +1246,7 @@ class HierarchicalNswLite {
       tableint *cpu_ids = reinterpret_cast<tableint *>(static_cast<linklistsizeint *>(cpu_link_list) + 1);
       cudaCheck(
           cudaMemcpy(
-              cpu_ids,
-              gpu_link_list + sizeof(linklistsizeint),
-              sizeof(tableint) * gpu_count,
-              cudaMemcpyDeviceToHost),
+              cpu_ids, gpu_link_list + sizeof(linklistsizeint), sizeof(tableint) * gpu_count, cudaMemcpyDeviceToHost),
           "cudaMemcpy",
           __FILE__,
           __LINE__);
@@ -1350,8 +1366,7 @@ class HierarchicalNswLite {
         __FILE__,
         __LINE__);
     const auto alloc_t1 = std::chrono::steady_clock::now();
-    const double ms_alloc =
-        std::chrono::duration<double, std::milli>(alloc_t1 - alloc_t0).count();
+    const double ms_alloc = std::chrono::duration<double, std::milli>(alloc_t1 - alloc_t0).count();
 
     cudaCheck(cudaEventRecord(ev_build_start), "cudaEventRecord", __FILE__, __LINE__);
     cudaCheck(launch_build_graph_kernel(device_gpu_graph_state_), "launch_build_graph_kernel", __FILE__, __LINE__);
@@ -1359,10 +1374,7 @@ class HierarchicalNswLite {
     cudaCheck(cudaEventSynchronize(ev_build_end), "cudaEventSynchronize", __FILE__, __LINE__);
     float ms_build = 0.0f;
     cudaCheck(
-        cudaEventElapsedTime(&ms_build, ev_build_start, ev_build_end),
-        "cudaEventElapsedTime",
-        __FILE__,
-        __LINE__);
+        cudaEventElapsedTime(&ms_build, ev_build_start, ev_build_end), "cudaEventElapsedTime", __FILE__, __LINE__);
 
     cudaCheck(cudaEventDestroy(ev_prepare_start), "cudaEventDestroy", __FILE__, __LINE__);
     cudaCheck(cudaEventDestroy(ev_prepare_end), "cudaEventDestroy", __FILE__, __LINE__);

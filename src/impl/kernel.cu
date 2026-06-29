@@ -9,6 +9,8 @@ namespace cg = cooperative_groups;
 namespace {
 
 constexpr unsigned long long kRandomLevelSeed = 0x9E3779B97F4A7C15ULL;
+constexpr uint32_t kChangedOldLinkFlag = 1U << 31;
+constexpr uint32_t kLinkCountMask = ~kChangedOldLinkFlag;
 }  // namespace
 
 struct Neighbor {
@@ -73,7 +75,32 @@ __device__ uint32_t get_frozen_link_count(GpuGraphState *state, uint32_t interna
       state->element_levels[internal_id] < level) {
     return 0;
   }
-  return state->frozen_link_counts[frozen_link_count_offset(state, internal_id, level)];
+  return state->frozen_link_counts[frozen_link_count_offset(state, internal_id, level)] & kLinkCountMask;
+}
+
+__device__ uint32_t changed_old_link_level_offset(GpuGraphState *state, int level) {
+  return static_cast<uint32_t>(level) * static_cast<uint32_t>(BATCHSZ_PER_NEW) * state->maxM0;
+}
+
+__device__ uint32_t changed_old_link_level_capacity(GpuGraphState *state) {
+  return static_cast<uint32_t>(BATCHSZ_PER_NEW) * state->maxM0;
+}
+
+__device__ void record_changed_old_link(GpuGraphState *state, uint32_t internal_id, int level) {
+  if (internal_id >= state->cur_element_count || level < 0 || level >= MAX_HNSW_LEVEL) return;
+
+  uint32_t *frozen_count = state->frozen_link_counts + frozen_link_count_offset(state, internal_id, level);
+  const uint32_t previous = atomicOr(frozen_count, kChangedOldLinkFlag);
+  if ((previous & kChangedOldLinkFlag) != 0) return;
+
+  const uint32_t offset = atomicAdd(&state->changed_old_link_counts[level], 1U);
+#ifndef NDEBUG
+  if (offset >= changed_old_link_level_capacity(state)) {
+    printf("Fatal: changed_old_links out of bound at level %d\n", level);
+    assert(false);
+  }
+#endif
+  state->changed_old_links[changed_old_link_level_offset(state, level) + offset] = internal_id;
 }
 
 #define mul(x, y) (x * y)
@@ -174,32 +201,50 @@ __device__ void bitonic_sort_id_by_dis(GpuGraphState *state) {
   }
 }
 
+__device__ void bitonic_sort(GpuGraphState *state, uint32_t vid, int lv) {
+  uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+  uint32_t *datal = (uint32_t *)(linkl + 1);
+  float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+  int len = getListCount(linkl);
+  if (len <= 1) return;
+
+  const unsigned tid = threadIdx.x;
+  const unsigned sort_len = next_power_of_two(len);
+  for (unsigned stride = 1; stride < sort_len; stride <<= 1) {
+    for (unsigned step = stride; step > 0; step >>= 1) {
+      for (unsigned k = tid; k < sort_len / 2; k += blockDim.x) {
+        unsigned a = 2 * step * (k / step);
+        unsigned b = k % step;
+        unsigned u = ((step == stride) ? (a + step - 1 - b) : (a + b));
+        unsigned d = a + b + step;
+        if (d < len && distl[u] > distl[d]) {
+          swap(distl[u], distl[d]);
+          swap(datal[u], datal[d]);
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
 __device__ void bitonic_sort_id_for_ll(GpuGraphState *state) {
+  for (int lv = 0; lv <= state->maxlevel; ++lv) {
+    const uint32_t count = state->changed_old_link_counts[lv];
+    const uint32_t base = changed_old_link_level_offset(state, lv);
+    for (uint32_t idx = blockIdx.x; idx < count; idx += gridDim.x) {
+      const uint32_t vid = state->changed_old_links[base + idx];
+      bitonic_sort(state, vid, lv);
+    }
+  }
+}
+
+__device__ void bitonic_sort_id_for_all_ll(GpuGraphState *state) {
   for (int vid = blockIdx.x; vid < state->cur_element_count; vid += gridDim.x) {
     for (int lv = 0; lv <= state->element_levels[vid]; lv++) {
       uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
-      uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
-      int len = getListCount(linkl);
-      if (len <= 1 || len == get_frozen_link_count(state, vid, lv)) continue;
-
-      const unsigned tid = threadIdx.x;
-      const unsigned sort_len = next_power_of_two(len);
-      for (unsigned stride = 1; stride < sort_len; stride <<= 1) {
-        for (unsigned step = stride; step > 0; step >>= 1) {
-          for (unsigned k = tid; k < sort_len / 2; k += blockDim.x) {
-            unsigned a = 2 * step * (k / step);
-            unsigned b = k % step;
-            unsigned u = ((step == stride) ? (a + step - 1 - b) : (a + b));
-            unsigned d = a + b + step;
-            if (d < len && distl[u] > distl[d]) {
-              swap(distl[u], distl[d]);
-              swap(datal[u], datal[d]);
-            }
-          }
-          __syncthreads();
-        }
-      }
+      const int len = getListCount(linkl);
+      if (len <= 1 || len == static_cast<int>(get_frozen_link_count(state, vid, lv))) continue;
+      bitonic_sort(state, vid, lv);
     }
   }
 }
@@ -249,6 +294,9 @@ __device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv) {
   int tid = threadIdx.x;
   if (tid == 0) {
     state->old_vec_fetch_offset = 0;
+  }
+  for (int lv = tid; lv < MAX_HNSW_LEVEL; lv += blockDim.x) {
+    state->changed_old_link_counts[lv] = 0;
   }
   __syncthreads();
   for (int i = tid; i < state->cur_element_count; i += blockDim.x) {
@@ -443,7 +491,7 @@ __device__ void compute_dist_between_new_kernel(GpuGraphState *state) {
 }
 
 // 1 block for 1 new vector
-__device__ void connect_new_to_old_kernel(GpuGraphState *state, int startup_lvl) {
+__device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int startup_lvl) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
   __shared__ float prev_neighbor[DIM];
@@ -572,6 +620,7 @@ __device__ void connect_new_to_old_kernel(GpuGraphState *state, int startup_lvl)
         float *other_distl =
             lv == 0 ? (float *)get_linklist_dist0(state, cand) : (float *)get_linklist_dist(state, cand, lv);
         int other_pos = atomicAdd((uint32_t *)other_linkl, 1);
+        record_changed_old_link(state, cand, lv);
 #ifndef NDEBUG
         if (other_pos >= capacity) {
           printf("Fatal: reverse link list out of bound at level %d for node %u\n", lv, cand);
@@ -800,7 +849,8 @@ __global__ void build_graph_kernel(GpuGraphState *state) {
     }
     const int startup_level = min(hi, state->maxlevel);
     if (blockIdx.x == 0) {
-      aggregate_on_level_kernel(state, startup_level);  // aggregate the old vectors available on the startup level
+      // aggregate the old vectors available on the startup level
+      aggregate_on_level_kernel(state, startup_level);  // Reset per-level changed_old_link_counts by the way.
     }
     grid.sync();
     // Replacement: compute_dist_with_old_kernel can be switched to compute_dist_block_wmma in-place per old batch.
@@ -815,28 +865,30 @@ __global__ void build_graph_kernel(GpuGraphState *state) {
     // for the new vectors, sort old vectors by distance
     bitonic_sort_id_by_dis(state);
     // connect the new vectors to only the old vectors in upper levels
-    connect_new_to_old_kernel(state, startup_level);
+    connect_new_to_old_at_upper_kernel(state, startup_level);
 
     grid.sync();
+
     // connect the new vectors to the old vectors in lower levels
     snapshot_frozen_link_counts_kernel(state, startup_level - 1);
     grid.sync();
-    search_knn_kernel(state, startup_level);
-
+    search_knn_at_lower_kernel(state, startup_level);
     // for the new vectors, combine and sort old and new vectors by distance
     finally_prune_for_new_kernel(state);
-
-    // search_knn_kernel appends reverse edges into old-node link lists.
     // Wait for every block to finish those global mutations before any block
     // starts sorting/pruning old-node adjacency, otherwise later phases can
     // observe partially updated per-level lists.
     grid.sync();
 
-    // sort and prune for the old vectors
-    bitonic_sort_id_for_ll(state);
-    prune_neighbors_kernel(state);
+    // Sort and prune all old-node lists.
+    // bitonic_sort_id_for_all_ll(state);
+    // prune_neighbors_for_all_kernel(state); // Update frozen link counts for all levels.
 
+    // Sort and prune only old-node lists that received reverse edges in this batch.
+    bitonic_sort_id_for_ll(state);
+    prune_neighbors_kernel(state);  // Update frozen link counts for the levels that received reverse edges.
     grid.sync();
+
     if (blockIdx.x == 0) {
       update_level_counts_kernel(state);
     }
@@ -1143,6 +1195,110 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
   __shared__ unsigned char pruned_mask[BATCHSZ_PER_OLD + BATCHSZ_PER_NEW];
   __shared__ bool can_continue;
 
+  for (int lv = 0; lv <= state->maxlevel; ++lv) {
+    const uint32_t count = state->changed_old_link_counts[lv];
+    const uint32_t base = changed_old_link_level_offset(state, lv);
+    for (uint32_t idx = blockIdx.x; idx < count; idx += gridDim.x) {
+      const uint32_t vid = state->changed_old_links[base + idx];
+      int M = lv ? state->M : state->maxM0;
+
+      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+      uint32_t *datal = (uint32_t *)(linkl + 1);
+      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+      int sz = getListCount(linkl);
+
+      if (sz > M) {
+        if (threadIdx.x == 0) {
+          prev_neigh_rank = 0;
+          prev_neigh_id = datal[0];
+          prev_neigh_dist = distl[0];
+          datal[0] = prev_neigh_id;
+          distl[0] = prev_neigh_dist;
+          curr_neigh_cnt = 1;
+        }
+        __syncthreads();
+
+        for (int i = threadIdx.x; i < sz; i += blockDim.x) {
+          pruned_mask[i] = 0;
+        }
+        for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
+          prev_neigh[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
+        }
+        __syncthreads();
+
+        while (curr_neigh_cnt < M) {
+          if (threadIdx.x == 0) {
+            can_continue = 0;
+          }
+          __syncthreads();
+          const int tx = threadIdx.x % warpSize;  // compute distance along this dimension
+          const int ty = threadIdx.x / warpSize;  // compute for different candidates
+          const int nrow = blockDim.x / warpSize;
+
+          for (int i = ty; i < sz; i += nrow) {
+            if (i <= prev_neigh_rank) continue;
+            if (pruned_mask[i] == 0) {
+              can_continue = 1;
+              float dist = 0.0f;
+              const int cand = datal[i];
+              for (int j = tx; j < DIM; j += warpSize) {
+                dist += (state->vector_data[cand * state->vector_dim + j] - prev_neigh[j]) *
+                        (state->vector_data[cand * state->vector_dim + j] - prev_neigh[j]);
+              }
+              for (int lane = warpSize / 2; lane > 0; lane /= 2) {
+                dist += __shfl_down_sync(0xffffffff, dist, lane);
+              }
+              if (tx == 0 && dist < prev_neigh_dist) {
+                pruned_mask[i] = 1;
+              }
+            }
+          }
+          __syncthreads();
+          if (!can_continue) {
+            break;
+          }
+          if (threadIdx.x == 0) {
+            for (int i = prev_neigh_rank + 1; i < sz; i++) {
+              if (pruned_mask[i] == 0) {
+                prev_neigh_rank = i;
+                prev_neigh_id = datal[i];
+                prev_neigh_dist = distl[i];
+                distl[curr_neigh_cnt] = prev_neigh_dist;
+                datal[curr_neigh_cnt] = prev_neigh_id;
+                curr_neigh_cnt++;
+                pruned_mask[i] = 1;
+                break;
+              }
+            }
+          }
+          __syncthreads();
+          for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
+            prev_neigh[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
+          }
+          __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+          setListCount(linkl, curr_neigh_cnt);
+        }
+      }
+      if (threadIdx.x == 0) {
+        state->frozen_link_counts[frozen_link_count_offset(state, vid, lv)] = getListCount(linkl);
+      }
+      __syncthreads();
+    }
+  }
+}
+
+__device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
+  __shared__ uint32_t prev_neigh_rank;
+  __shared__ uint32_t prev_neigh_id;
+  __shared__ float prev_neigh[DIM];
+  __shared__ float prev_neigh_dist;
+  __shared__ uint32_t curr_neigh_cnt;
+  __shared__ unsigned char pruned_mask[BATCHSZ_PER_OLD + BATCHSZ_PER_NEW];
+  __shared__ bool can_continue;
+
   for (int vid = blockIdx.x; vid < state->cur_element_count; vid += gridDim.x) {
     for (int lv = 0; lv <= state->element_levels[vid]; ++lv) {
       int M = lv ? state->M : state->maxM0;
@@ -1228,13 +1384,17 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
           setListCount(linkl, curr_neigh_cnt);
         }
       }
+      if (threadIdx.x == 0) {
+        state->frozen_link_counts[frozen_link_count_offset(state, vid, lv)] = getListCount(linkl);
+      }
+      __syncthreads();
     }
   }
 }
 
 // 1 block for 1 new vector
 // threads for distance computation
-__device__ void search_knn_kernel(GpuGraphState *state, int startup_lv) {
+__device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv) {
   __shared__ uint32_t *visited;
   __shared__ uint32_t visited_tag;
   __shared__ Neighbor candq[CANDQ_SZ];
@@ -1432,6 +1592,7 @@ __device__ void search_knn_kernel(GpuGraphState *state, int startup_lv) {
         float *other_distl =
             lv == 0 ? (float *)get_linklist_dist0(state, datal[i]) : (float *)get_linklist_dist(state, datal[i], lv);
         uint32_t pos = atomicAdd((uint32_t *)(other_linkl), 1);
+        record_changed_old_link(state, datal[i], lv);
         const uint32_t capacity = lv == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
 #ifndef NDEBUG
         if (pos >= capacity) {

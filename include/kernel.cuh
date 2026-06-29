@@ -57,6 +57,8 @@ struct GpuGraphState {
   uint32_t *news_rank{nullptr};
   uint32_t *visited{nullptr};
   uint32_t *frozen_link_counts{nullptr};
+  uint32_t *changed_old_links{nullptr};
+  uint32_t *changed_old_link_counts{nullptr};
 };
 
 __global__ void prepare_graph_kernel(GpuGraphState *state);
@@ -83,7 +85,9 @@ __device__ void prune_candidates_kernel(GpuGraphState *state, int lv);
 // For old vectors
 __device__ void prune_neighbors_kernel(GpuGraphState *state);
 
-__device__ void search_knn_kernel(GpuGraphState *state, int startup_level);
+__device__ void prune_neighbors_for_all_kernel(GpuGraphState *state);
+
+__device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_level);
 
 __device__ void snapshot_frozen_link_counts_kernel(GpuGraphState *state, int max_level);
 
