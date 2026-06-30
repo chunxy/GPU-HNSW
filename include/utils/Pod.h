@@ -51,6 +51,7 @@ struct Args {
   int nthread = 1;
   int batchsz = 100;
   bool build = true;
+  bool profile = false;
 
   Args(int argc, char **argv) {
     po::options_description configs;
@@ -68,6 +69,7 @@ struct Args {
     optional_configs.add_options()("nthread", po::value<decltype(nthread)>(&nthread));
     optional_configs.add_options()("batchsz", po::value<decltype(batchsz)>(&batchsz));
     optional_configs.add_options()("build", po::value<decltype(build)>(&build));
+    optional_configs.add_options()("profile", po::bool_switch(&profile), "Profile build_graph_kernel phases");
     // Merge required and optional configs.
     configs.add(required_configs).add(optional_configs);
     // Parse arguments.

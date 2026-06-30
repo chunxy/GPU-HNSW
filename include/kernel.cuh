@@ -61,6 +61,12 @@ struct GpuGraphState {
   uint32_t *frozen_link_counts{nullptr};
   uint32_t *changed_old_links{nullptr};
   uint32_t *changed_old_link_counts{nullptr};
+
+#ifdef PROFILE_BUILD_PHASES
+  bool profile_build_phases{false};
+  uint64_t *build_phase_cycles{nullptr};
+  uint64_t build_batch_count{0};
+#endif
 };
 
 __global__ void prepare_graph_kernel(GpuGraphState *state);

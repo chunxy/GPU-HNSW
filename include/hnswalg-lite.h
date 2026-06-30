@@ -5,6 +5,7 @@
 #include <fmt/core.h>
 #include <stdlib.h>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -17,6 +18,7 @@
 #include "hnswlib/hnswlib.h"
 #include "hnswlib/visited_list_pool.h"
 #include "kernel.cuh"
+#include "profile.h"
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -108,6 +110,7 @@ class HierarchicalNswLite {
 
   GpuFreeFn gpu_free_fn_{nullptr};
   bool gpu_graph_ready_{false};
+  bool profile_build_phases_{false};
 
   HierarchicalNswLite(SpaceInterface<dist_t> *s) {}
 
@@ -220,9 +223,6 @@ class HierarchicalNswLite {
     revSize_ = 1.0 / mult_;
 
     d_vector_data_ = vector_data;
-
-    move_to_gpu();
-    // build_graph_gpu();
   }
 
   ~HierarchicalNswLite() { clear(); }
@@ -249,6 +249,9 @@ class HierarchicalNswLite {
 
   void release_gpu_state() {
     if (gpu_free_fn_ != nullptr) {
+#ifdef PROFILE_BUILD_PHASES
+      gpu_free_fn_(host_gpu_graph_state_.build_phase_cycles);
+#endif
       gpu_free_fn_(host_gpu_graph_state_.precomputed_new_new_dist);
       gpu_free_fn_(host_gpu_graph_state_.precomputed_new_new_rank);
       gpu_free_fn_(host_gpu_graph_state_.news_dist);
@@ -273,6 +276,8 @@ class HierarchicalNswLite {
   }
 
   void setEf(size_t ef) { ef_ = ef; }
+
+  void set_profile_build_phases(bool enabled) { profile_build_phases_ = enabled; }
 
   inline std::mutex &getLabelOpMutex(labeltype label) const {
     size_t lock_id = label & (MAX_LABEL_OPERATION_LOCKS - 1);
@@ -1156,6 +1161,23 @@ class HierarchicalNswLite {
             __LINE__);
       }
 
+#ifdef PROFILE_BUILD_PHASES
+      cudaCheck(
+          cudaMalloc(
+              &(host_gpu_graph_state_.build_phase_cycles), sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount)),
+          "cudaMalloc",
+          __FILE__,
+          __LINE__);
+      cudaCheck(
+          cudaMemset(
+              host_gpu_graph_state_.build_phase_cycles, 0, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount)),
+          "cudaMemset",
+          __FILE__,
+          __LINE__);
+      host_gpu_graph_state_.profile_build_phases = profile_build_phases_;
+      host_gpu_graph_state_.build_batch_count = 0;
+#endif
+
       // copy the graph state to GPU
       cudaCheck(cudaMalloc(&device_gpu_graph_state_, sizeof(GpuGraphState)), "cudaMalloc", __FILE__, __LINE__);
       cudaCheck(
@@ -1397,10 +1419,7 @@ class HierarchicalNswLite {
     cudaCheck(cudaEventSynchronize(ev_alloc_end), "cudaEventSynchronize", __FILE__, __LINE__);
     float ms_alloc = 0.0f;
     cudaCheck(
-        cudaEventElapsedTime(&ms_alloc, ev_alloc_start, ev_alloc_end),
-        "cudaEventElapsedTime",
-        __FILE__,
-        __LINE__);
+        cudaEventElapsedTime(&ms_alloc, ev_alloc_start, ev_alloc_end), "cudaEventElapsedTime", __FILE__, __LINE__);
 
     cudaCheck(cudaEventRecord(ev_build_start), "cudaEventRecord", __FILE__, __LINE__);
     cudaCheck(launch_build_graph_kernel(device_gpu_graph_state_), "launch_build_graph_kernel", __FILE__, __LINE__);
@@ -1426,9 +1445,44 @@ class HierarchicalNswLite {
         ms_alloc,
         ms_build);
 
-    // // copy back to CPU
-    // cudaCheck(cudaDeviceSynchronize(), "cudaDeviceSynchronize", __FILE__, __LINE__);
-    // copy_from_gpu();
+#ifdef PROFILE_BUILD_PHASES
+    if (profile_build_phases_) {
+      GpuGraphState device_state{};
+      cudaCheck(
+          cudaMemcpy(&device_state, device_gpu_graph_state_, sizeof(GpuGraphState), cudaMemcpyDeviceToHost),
+          "cudaMemcpy",
+          __FILE__,
+          __LINE__);
+      std::vector<uint64_t> phase_cycles(static_cast<size_t>(kBuildPhaseCount), 0ULL);
+      cudaCheck(
+          cudaMemcpy(
+              phase_cycles.data(),
+              device_state.build_phase_cycles,
+              sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount),
+              cudaMemcpyDeviceToHost),
+          "cudaMemcpy",
+          __FILE__,
+          __LINE__);
+      print_build_phase_profile(phase_cycles.data(), device_state.build_batch_count);
+      profile_build_phases_ = false;
+      host_gpu_graph_state_.profile_build_phases = false;
+      cudaCheck(
+          cudaMemcpy(
+              reinterpret_cast<char *>(device_gpu_graph_state_) + offsetof(GpuGraphState, profile_build_phases),
+              &host_gpu_graph_state_.profile_build_phases,
+              sizeof(bool),
+              cudaMemcpyHostToDevice),
+          "cudaMemcpy",
+          __FILE__,
+          __LINE__);
+    }
+#else
+    if (profile_build_phases_) {
+      fmt::print(
+          "build_graph_kernel phase profile requested, but this binary was built without "
+          "-DPROFILE_BUILD_PHASES=ON\n");
+    }
+#endif
   }
 };
 }  // namespace hnswlib

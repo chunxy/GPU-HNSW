@@ -8,6 +8,33 @@ namespace cg = cooperative_groups;
 
 namespace {
 
+__device__ uint64_t build_phase_begin(GpuGraphState *state, const cg::grid_group &grid) {
+#ifdef PROFILE_BUILD_PHASES
+  return (state->profile_build_phases && grid.thread_rank() == 0) ? clock64() : 0ULL;
+#else
+  (void)state;
+  (void)grid;
+  return 0ULL;
+#endif
+}
+
+__device__ void build_phase_record(GpuGraphState *state, const cg::grid_group &grid, BuildPhase phase, uint64_t t0) {
+#ifdef PROFILE_BUILD_PHASES
+  if (state->profile_build_phases && grid.thread_rank() == 0) {
+    atomicAdd(
+        reinterpret_cast<unsigned long long *>(state->build_phase_cycles + static_cast<int>(phase)),
+        static_cast<unsigned long long>(clock64() - t0));
+  }
+#else
+  (void)state;
+  (void)grid;
+  (void)phase;
+  (void)t0;
+#endif
+}
+
+__device__ void build_grid_sync(const cg::grid_group &grid) { grid.sync(); }
+
 constexpr unsigned long long kRandomLevelSeed = 0x9E3779B97F4A7C15ULL;
 constexpr uint32_t kChangedOldLinkFlag = 1U << 31;
 constexpr uint32_t kLinkCountMask = ~kChangedOldLinkFlag;
@@ -895,54 +922,80 @@ __global__ void build_graph_kernel(GpuGraphState *state) {
       }
     }
     const int startup_level = min(hi, state->maxlevel);
+
+    uint64_t phase_t0 = build_phase_begin(state, grid);
     if (blockIdx.x == 0) {
       // aggregate the old vectors available on the startup level
       aggregate_on_level_kernel(state, startup_level);  // Reset per-level changed_old_link_counts by the way.
     }
-    grid.sync();
-    compute_dist_with_old_kernel(state);
-    load_precomputed_new_new_dist(state);
-    grid.sync();
+    build_phase_record(state, grid, kBuildPhaseAggregate, phase_t0);
+    build_grid_sync(grid);
 
+    phase_t0 = build_phase_begin(state, grid);
+    compute_dist_with_old_kernel(state);
+    build_phase_record(state, grid, kBuildPhaseDistOldNew, phase_t0);
+
+    phase_t0 = build_phase_begin(state, grid);
+    load_precomputed_new_new_dist(state);
+    build_phase_record(state, grid, kBuildPhaseLoadNewNew, phase_t0);
+    build_grid_sync(grid);
+
+    phase_t0 = build_phase_begin(state, grid);
     // for the new vectors, sort old vectors by distance
     bitonic_sort_id_by_dis(state);
+    build_phase_record(state, grid, kBuildPhaseSortOldByDist, phase_t0);
+
+    phase_t0 = build_phase_begin(state, grid);
     // connect the new vectors to only the old vectors in upper levels
     connect_new_to_old_at_upper_kernel(state, startup_level);
+    build_phase_record(state, grid, kBuildPhaseConnectUpper, phase_t0);
+    build_grid_sync(grid);
 
-    grid.sync();
-
+    phase_t0 = build_phase_begin(state, grid);
     // connect the new vectors to the old vectors in lower levels
     snapshot_frozen_link_counts_kernel(state, startup_level - 1);
-    grid.sync();
+    build_phase_record(state, grid, kBuildPhaseSnapshotFrozen, phase_t0);
+    build_grid_sync(grid);
+
+    phase_t0 = build_phase_begin(state, grid);
     search_knn_at_lower_kernel(state, startup_level);
+    build_phase_record(state, grid, kBuildPhaseSearchLower, phase_t0);
+
+    phase_t0 = build_phase_begin(state, grid);
     // for the new vectors, combine and sort old and new vectors by distance
     finally_prune_for_new_kernel(state);
+    build_phase_record(state, grid, kBuildPhaseFinallyPruneNew, phase_t0);
     // Wait for every block to finish those global mutations before any block
     // starts sorting/pruning old-node adjacency, otherwise later phases can
     // observe partially updated per-level lists.
-    grid.sync();
+    build_grid_sync(grid);
 
-    // Sort and prune all old-node lists.
-    // bitonic_sort_id_for_all_ll(state);
-    // prune_neighbors_for_all_kernel(state); // Update frozen link counts for all levels.
-
+    phase_t0 = build_phase_begin(state, grid);
     // Sort and prune only old-node lists that received reverse edges in this batch.
     bitonic_sort_id_for_ll(state);
     prune_neighbors_kernel(state);  // Update frozen link counts for the levels that received reverse edges.
-    grid.sync();
+    build_phase_record(state, grid, kBuildPhaseSortPruneOld, phase_t0);
+    build_grid_sync(grid);
 
+    phase_t0 = build_phase_begin(state, grid);
     if (blockIdx.x == 0) {
       update_level_counts_kernel(state);
     }
     if (grid.thread_rank() == 0) {
       state->cur_element_count += new_count;
+#ifdef PROFILE_BUILD_PHASES
+      if (state->profile_build_phases) {
+        state->build_batch_count += 1ULL;
+      }
+#endif
 #ifndef NDEBUG
       if (state->cur_element_count % 1024 == 0) {
         printf("cur_element_count=%d\n", state->cur_element_count);
       }
 #endif
     }
-    grid.sync();
+    build_phase_record(state, grid, kBuildPhaseUpdateBatch, phase_t0);
+    build_grid_sync(grid);
   }
 }
 
@@ -1459,13 +1512,6 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
     if (threadIdx.x == 0) {
       auto ranks = state->news_rank + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
       auto dists = state->news_dist + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
-      // for (int i = 0; i < state->old_vec_fetch_offset; i++) {
-      //   if (ranks[i] < state->cur_element_count) {
-      //     curr_obj_shared = ranks[i];
-      //     curr_dist_bits_shared = __float_as_int(dists[i]);
-      //     break;
-      //   }
-      // }
       curr_obj_shared = ranks[0];
       curr_dist_bits_shared = __float_as_int(dists[0]);
       visited = state->visited + blockIdx.x * state->max_elements;
@@ -1651,3 +1697,44 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
     }
   }
 }
+
+#ifdef PROFILE_BUILD_PHASES
+#include <fmt/format.h>
+
+void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count) {
+  if (batch_count == 0 || cycles == nullptr) {
+    fmt::print("build_graph_kernel phase profile: no batches recorded\n");
+    return;
+  }
+
+  int clock_rate_khz = 0;
+  cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, 0);
+  if (clock_rate_khz <= 0) {
+    fmt::print("build_graph_kernel phase profile: unable to read GPU clock rate\n");
+    return;
+  }
+
+  const double cycles_per_ms = static_cast<double>(clock_rate_khz);
+  double total_ms = 0.0;
+  double phase_ms[kBuildPhaseCount]{};
+  for (int phase = 0; phase < kBuildPhaseCount; ++phase) {
+    phase_ms[phase] = static_cast<double>(cycles[phase]) / cycles_per_ms;
+    total_ms += phase_ms[phase];
+  }
+
+  fmt::print(
+      "build_graph_kernel phase profile ({} batches, {:.3f} ms measured, {:.3f} ms per batch):\n",
+      batch_count,
+      total_ms,
+      total_ms / static_cast<double>(batch_count));
+  for (int phase = 0; phase < kBuildPhaseCount; ++phase) {
+    const double pct = total_ms > 0.0 ? (phase_ms[phase] * 100.0 / total_ms) : 0.0;
+    fmt::print(
+        "  {:<22} {:>10.3f} ms  {:>5.1f}%  {:>8.3f} ms/batch\n",
+        build_phase_name(static_cast<BuildPhase>(phase)),
+        phase_ms[phase],
+        pct,
+        phase_ms[phase] / static_cast<double>(batch_count));
+  }
+}
+#endif  // PROFILE_BUILD_PHASES

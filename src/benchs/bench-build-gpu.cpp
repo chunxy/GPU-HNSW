@@ -39,6 +39,10 @@ int main(int argc, char **argv) {
   // string search = fmt::format("efs_{}", efs);
 
   hnswlib::HierarchicalNswLite<float> index(c.vector_dim, c.n_base, xb, args.M, args.efc);
+  if (args.profile) {
+    index.set_profile_build_phases(true);
+  }
+  index.move_to_gpu();
   std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   index.build_graph_gpu();
   cudaDeviceSynchronize();
