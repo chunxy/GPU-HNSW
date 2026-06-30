@@ -5,7 +5,6 @@
 #include <fmt/core.h>
 #include <stdlib.h>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -250,6 +249,8 @@ class HierarchicalNswLite {
 
   void release_gpu_state() {
     if (gpu_free_fn_ != nullptr) {
+      gpu_free_fn_(host_gpu_graph_state_.precomputed_new_new_dist);
+      gpu_free_fn_(host_gpu_graph_state_.precomputed_new_new_rank);
       gpu_free_fn_(host_gpu_graph_state_.news_dist);
       gpu_free_fn_(host_gpu_graph_state_.news_rank);
       gpu_free_fn_(host_gpu_graph_state_.frozen_link_counts);
@@ -998,6 +999,8 @@ class HierarchicalNswLite {
         checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (M_ + BATCHSZ_PER_NEW) * 2, "size_links_per_element");
     const uint32_t gpu_data_size = checked_u32(data_size_, "data_size");
     const size_t old_new_distances_count = (BATCHSZ_PER_NEW) * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
+    const size_t num_new_new_batches = (gpu_max_elements + BATCHSZ_PER_NEW - 1) / BATCHSZ_PER_NEW;
+    const size_t precomputed_new_new_count = num_new_new_batches * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
 
     auto malloc_and_copy = [&](void **dst, const void *src, size_t bytes) {
       if (bytes == 0) {
@@ -1132,6 +1135,22 @@ class HierarchicalNswLite {
             __LINE__);
         cudaCheck(
             cudaMalloc(&(host_gpu_graph_state_.news_rank), sizeof(uint32_t) * old_new_distances_count),
+            "cudaMalloc",
+            __FILE__,
+            __LINE__);
+      }
+
+      if (precomputed_new_new_count == 0) {
+        host_gpu_graph_state_.precomputed_new_new_dist = nullptr;
+        host_gpu_graph_state_.precomputed_new_new_rank = nullptr;
+      } else {
+        cudaCheck(
+            cudaMalloc(&(host_gpu_graph_state_.precomputed_new_new_dist), sizeof(float) * precomputed_new_new_count),
+            "cudaMalloc",
+            __FILE__,
+            __LINE__);
+        cudaCheck(
+            cudaMalloc(&(host_gpu_graph_state_.precomputed_new_new_rank), sizeof(uint32_t) * precomputed_new_new_count),
             "cudaMalloc",
             __FILE__,
             __LINE__);
@@ -1317,16 +1336,25 @@ class HierarchicalNswLite {
 
     cudaEvent_t ev_prepare_start = nullptr;
     cudaEvent_t ev_prepare_end = nullptr;
+    cudaEvent_t ev_alloc_start = nullptr;
+    cudaEvent_t ev_alloc_end = nullptr;
     cudaEvent_t ev_build_start = nullptr;
     cudaEvent_t ev_build_end = nullptr;
     cudaCheck(cudaEventCreate(&ev_prepare_start), "cudaEventCreate", __FILE__, __LINE__);
     cudaCheck(cudaEventCreate(&ev_prepare_end), "cudaEventCreate", __FILE__, __LINE__);
+    cudaCheck(cudaEventCreate(&ev_alloc_start), "cudaEventCreate", __FILE__, __LINE__);
+    cudaCheck(cudaEventCreate(&ev_alloc_end), "cudaEventCreate", __FILE__, __LINE__);
     cudaCheck(cudaEventCreate(&ev_build_start), "cudaEventCreate", __FILE__, __LINE__);
     cudaCheck(cudaEventCreate(&ev_build_end), "cudaEventCreate", __FILE__, __LINE__);
 
     // compute the powers, generate the random levels, and convert to half precision
     cudaCheck(cudaEventRecord(ev_prepare_start), "cudaEventRecord", __FILE__, __LINE__);
     cudaCheck(launch_prepare_graph_kernel(device_gpu_graph_state_), "launch_prepare_graph_kernel", __FILE__, __LINE__);
+    cudaCheck(
+        launch_precompute_new_new_dist_kernel(device_gpu_graph_state_, host_gpu_graph_state_.max_elements),
+        "launch_precompute_new_new_dist_kernel",
+        __FILE__,
+        __LINE__);
     cudaCheck(cudaEventRecord(ev_prepare_end), "cudaEventRecord", __FILE__, __LINE__);
     cudaCheck(cudaEventSynchronize(ev_prepare_end), "cudaEventSynchronize", __FILE__, __LINE__);
     float ms_prepare = 0.0f;
@@ -1336,8 +1364,8 @@ class HierarchicalNswLite {
         __FILE__,
         __LINE__);
 
-    // assign the link lists for GPU (host wall time: D2H + cudaMalloc/cudaMemset + pointer table H2D)
-    const auto alloc_t0 = std::chrono::steady_clock::now();
+    // assign the link lists for GPU (D2H + cudaMalloc/cudaMemset + pointer table H2D)
+    cudaCheck(cudaEventRecord(ev_alloc_start), "cudaEventRecord", __FILE__, __LINE__);
     cudaCheck(
         cudaMemcpy(
             element_levels_.data(),
@@ -1365,8 +1393,14 @@ class HierarchicalNswLite {
         "cudaMemcpy",
         __FILE__,
         __LINE__);
-    const auto alloc_t1 = std::chrono::steady_clock::now();
-    const double ms_alloc = std::chrono::duration<double, std::milli>(alloc_t1 - alloc_t0).count();
+    cudaCheck(cudaEventRecord(ev_alloc_end), "cudaEventRecord", __FILE__, __LINE__);
+    cudaCheck(cudaEventSynchronize(ev_alloc_end), "cudaEventSynchronize", __FILE__, __LINE__);
+    float ms_alloc = 0.0f;
+    cudaCheck(
+        cudaEventElapsedTime(&ms_alloc, ev_alloc_start, ev_alloc_end),
+        "cudaEventElapsedTime",
+        __FILE__,
+        __LINE__);
 
     cudaCheck(cudaEventRecord(ev_build_start), "cudaEventRecord", __FILE__, __LINE__);
     cudaCheck(launch_build_graph_kernel(device_gpu_graph_state_), "launch_build_graph_kernel", __FILE__, __LINE__);
@@ -1378,11 +1412,15 @@ class HierarchicalNswLite {
 
     cudaCheck(cudaEventDestroy(ev_prepare_start), "cudaEventDestroy", __FILE__, __LINE__);
     cudaCheck(cudaEventDestroy(ev_prepare_end), "cudaEventDestroy", __FILE__, __LINE__);
+    cudaCheck(cudaEventDestroy(ev_alloc_start), "cudaEventDestroy", __FILE__, __LINE__);
+    cudaCheck(cudaEventDestroy(ev_alloc_end), "cudaEventDestroy", __FILE__, __LINE__);
     cudaCheck(cudaEventDestroy(ev_build_start), "cudaEventDestroy", __FILE__, __LINE__);
     cudaCheck(cudaEventDestroy(ev_build_end), "cudaEventDestroy", __FILE__, __LINE__);
 
     fmt::print(
-        "build_graph_gpu timing: prepare_graph_kernel {:.3f} ms, link_list alloc/setup {:.3f} ms, "
+        "build_graph_gpu timing: "
+        "prepare_graph_kernel {:.3f} ms, "
+        "link_list alloc/setup {:.3f} ms, "
         "build_graph_kernel {:.3f} ms\n",
         ms_prepare,
         ms_alloc,

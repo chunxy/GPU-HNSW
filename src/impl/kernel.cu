@@ -415,11 +415,17 @@ __device__ void compute_dist_block_wmma(
   __syncthreads();
 }
 
-__device__ void compute_dist_between_new_kernel(GpuGraphState *state) {
-  half *new_vector_store = state->half_vector_data + state->cur_element_count * DIM;
-
-  const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
+__device__ void compute_new_new_dist_into_buffers(
+    GpuGraphState *state,
+    uint32_t batch_base,
+    uint32_t new_count,
+    float *dist_out,
+    uint32_t dist_row_stride,
+    uint32_t *rank_out,
+    uint32_t rank_row_stride) {
   if (new_count == 0) return;
+
+  half *new_vector_store = state->half_vector_data + batch_base * DIM;
 
   // compute new-new inner products using tensor core
   {
@@ -453,8 +459,8 @@ __device__ void compute_dist_between_new_kernel(GpuGraphState *state) {
           wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
 
-        float *output_ptr = state->news_dist + new_row * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES + new_col;
-        wmma::store_matrix_sync(output_ptr, c_frag, LEVEL_SZ_THRES + BATCHSZ_PER_NEW, wmma::mem_row_major);
+        float *output_ptr = dist_out + new_row * dist_row_stride + new_col;
+        wmma::store_matrix_sync(output_ptr, c_frag, dist_row_stride, wmma::mem_row_major);
       }
     }
   }
@@ -464,7 +470,7 @@ __device__ void compute_dist_between_new_kernel(GpuGraphState *state) {
   const int wmma_rows = (new_count / 16) * 16;
   const int wmma_cols = (new_count / 16) * 16;
   for (uint32_t i = 0; i < new_count; ++i) {
-    for (int j = threadIdx.x; j < new_count; j += blockDim.x) {
+    for (int j = threadIdx.x; j < static_cast<int>(new_count); j += blockDim.x) {
       if (i < static_cast<uint32_t>(wmma_rows) && j < wmma_cols) continue;
       float ip = 0.0f;
       const int row_st = i * DIM;
@@ -472,22 +478,63 @@ __device__ void compute_dist_between_new_kernel(GpuGraphState *state) {
       for (int k = 0; k < DIM; ++k) {
         ip += __half2float(new_vector_store[row_st + k]) * __half2float(new_vector_store[col_st + k]);
       }
-      state->news_dist[i * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES + j] = ip;
+      dist_out[i * dist_row_stride + j] = ip;
     }
   }
   __syncthreads();
 
   for (uint32_t i = 0; i < new_count; ++i) {
-    const uint32_t one = state->cur_element_count + i;
-    for (int j = threadIdx.x; j < new_count; j += blockDim.x) {
-      float ip = state->news_dist[i * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES + j];
-      state->news_dist[i * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES + j] = -2 * ip;
-      state->news_dist[i * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES + j] += state->vector_powers[one];
-      int another = state->cur_element_count + j;
-      state->news_dist[i * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES + j] += state->vector_powers[another];
-      state->news_rank[i * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES + j] = another;
+    const uint32_t one = batch_base + i;
+    for (int j = threadIdx.x; j < static_cast<int>(new_count); j += blockDim.x) {
+      const int out_idx = static_cast<int>(i) * dist_row_stride + j;
+      float ip = dist_out[out_idx];
+      dist_out[out_idx] = -2 * ip + state->vector_powers[one];
+      const uint32_t another = batch_base + static_cast<uint32_t>(j);
+      dist_out[out_idx] += state->vector_powers[another];
+      rank_out[static_cast<int>(i) * rank_row_stride + j] = another;
     }
   }
+}
+
+__device__ void load_precomputed_new_new_dist(GpuGraphState *state) {
+  const uint32_t batch_id = state->cur_element_count / BATCHSZ_PER_NEW;
+  const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
+  if (new_count == 0) return;
+
+  const size_t batch_offset = static_cast<size_t>(batch_id) * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
+  const float *src_dist = state->precomputed_new_new_dist + batch_offset;
+  const uint32_t *src_rank = state->precomputed_new_new_rank + batch_offset;
+  const int dst_row_stride = LEVEL_SZ_THRES + BATCHSZ_PER_NEW;
+  const int total = static_cast<int>(new_count) * static_cast<int>(new_count);
+
+  for (int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
+       idx += static_cast<int>(gridDim.x) * blockDim.x) {
+    const int i = idx / static_cast<int>(new_count);
+    const int j = idx % static_cast<int>(new_count);
+    const int dst = i * dst_row_stride + LEVEL_SZ_THRES + j;
+    const int src = i * BATCHSZ_PER_NEW + j;
+    state->news_dist[dst] = src_dist[src];
+    state->news_rank[dst] = src_rank[src];
+  }
+}
+
+__global__ void precompute_new_new_dist_kernel(GpuGraphState *state) {
+  const uint32_t batch_id = blockIdx.x;
+  const uint32_t batch_base = batch_id * BATCHSZ_PER_NEW;
+  if (batch_base >= state->max_elements) return;
+
+  const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - batch_base);
+  const size_t batch_offset = static_cast<size_t>(batch_id) * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
+  float *dist_out = state->precomputed_new_new_dist + batch_offset;
+  uint32_t *rank_out = state->precomputed_new_new_rank + batch_offset;
+  compute_new_new_dist_into_buffers(state, batch_base, new_count, dist_out, BATCHSZ_PER_NEW, rank_out, BATCHSZ_PER_NEW);
+}
+
+cudaError_t launch_precompute_new_new_dist_kernel(GpuGraphState *state, uint32_t max_elements) {
+  const uint32_t num_batches = (max_elements + BATCHSZ_PER_NEW - 1) / BATCHSZ_PER_NEW;
+  if (num_batches == 0) return cudaSuccess;
+  precompute_new_new_dist_kernel<<<num_batches, BLOCK_DIM>>>(state);
+  return cudaGetLastError();
 }
 
 // 1 block for 1 new vector
@@ -853,13 +900,8 @@ __global__ void build_graph_kernel(GpuGraphState *state) {
       aggregate_on_level_kernel(state, startup_level);  // Reset per-level changed_old_link_counts by the way.
     }
     grid.sync();
-    // Replacement: compute_dist_with_old_kernel can be switched to compute_dist_block_wmma in-place per old batch.
     compute_dist_with_old_kernel(state);
-    if (blockIdx.x == GRID_DIM - 1) {
-      // Replacement: compute_dist_block_wmma(state, new_store, new_store, new_count, new_count, LEVEL_SZ_THRES,
-      // state->cur_element_count, identity_ids)
-      compute_dist_between_new_kernel(state);
-    }
+    load_precomputed_new_new_dist(state);
     grid.sync();
 
     // for the new vectors, sort old vectors by distance
