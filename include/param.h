@@ -24,6 +24,11 @@ const int TOPQ_SZ = EFC + 16;  // 16 for the max number of neighbors
 
 const int CANDQ_SZ = 200;
 
+// search_knn_at_lower_kernel: per-warp neighbor staging during beam search
+const int SEARCH_WARP_COUNT = BLOCK_DIM / 32;
+const int WARP_STAGING_CAP = 16;  // >= ceil(maxM0 / SEARCH_WARP_COUNT); maxM0 is typically 2 * M
+
 static_assert(BATCHSZ_PER_NEW > GRID_DIM);
 static_assert(BATCHSZ_PER_OLD * GRID_DIM <= LEVEL_SZ_THRES);
 static_assert(DIM % 16 == 0);
+static_assert(BLOCK_DIM % 32 == 0);

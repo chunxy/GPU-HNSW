@@ -199,6 +199,36 @@ __device__ void MinPqPush(Neighbor *pq, int *size, float dist, int nodeid, bool 
   (*size)++;
 }
 
+__device__ void merge_staged_neighbors_into_queues(
+    Neighbor *candq,
+    int *candq_sz,
+    Neighbor *topq,
+    int *topq_sz,
+    float *topq_max,
+    Neighbor (*warp_staging)[WARP_STAGING_CAP],
+    const int *warp_staging_sz) {
+  for (int w = 0; w < SEARCH_WARP_COUNT; ++w) {
+    for (int i = 0; i < warp_staging_sz[w]; ++i) {
+      const float dist = warp_staging[w][i].distance;
+      const int nodeid = warp_staging[w][i].nodeid;
+      if (*topq_sz < EFC || dist < *topq_max) {
+        if (*candq_sz < CANDQ_SZ) {
+          MinPqPush(candq, candq_sz, dist, nodeid, false);
+        }
+        if (*topq_sz < TOPQ_SZ) {
+          MaxPqPush(topq, topq_sz, dist, nodeid, true);
+        }
+        while (*topq_sz > EFC) {
+          MaxPqPop(topq, topq_sz);
+        }
+        if (*topq_sz >= EFC) {
+          *topq_max = topq[0].distance;
+        }
+      }
+    }
+  }
+}
+
 __device__ void bitonic_sort_id_by_dis(GpuGraphState *state) {
   int len = state->old_vec_fetch_offset;
   float *distances = state->news_dist;
@@ -1501,6 +1531,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
   __shared__ int changed;
   __shared__ uint32_t curr_obj_shared;
   __shared__ int curr_dist_bits_shared;
+  __shared__ Neighbor warp_staging[SEARCH_WARP_COUNT][WARP_STAGING_CAP];
+  __shared__ int warp_staging_sz[SEARCH_WARP_COUNT];
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
@@ -1601,10 +1633,12 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         Neighbor tmp{candq[0].distance, candq[0].nodeid, candq[0].checked};
         if (threadIdx.x == 0) {
           atomicExch(&visited[tmp.nodeid], visited_tag);
-          candq[0] = candq[candq_sz - 1];
-          candq_sz--;
+          MinPqPop(candq, &candq_sz, &tmp);
         }
         __syncthreads();
+        if (tx == 0) {
+          warp_staging_sz[ty] = 0;
+        }
         const int size = get_frozen_link_count(state, tmp.nodeid, lv);
         uint32_t *linkl =
             size > 0 ? (lv == 0 ? get_linklist0(state, tmp.nodeid) : get_linklist(state, tmp.nodeid, lv)) : nullptr;
@@ -1634,36 +1668,25 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           for (int lane = warpSize / 2; lane > 0; lane /= 2) {
             dist += __shfl_down_sync(0xffffffff, dist, lane);
           }
-          // Instead of using lock, use atomic.
           if (tx == 0) {
-            if (topq_sz < EFC || dist < topq_max) {  // TODO: Multiple threads get here at the same time
-              int topq_pos = atomicAdd(&topq_sz, 1);
-              if (topq_pos < TOPQ_SZ) {
-                topq[topq_pos].nodeid = cand;
-                topq[topq_pos].distance = dist;
-              }
-              int candq_pos = atomicAdd(&candq_sz, 1);
-              if (candq_pos < CANDQ_SZ) {
-                candq[candq_pos].nodeid = cand;
-                candq[candq_pos].distance = dist;
-              }
+            const int pos = warp_staging_sz[ty];
+            if (pos < WARP_STAGING_CAP) {
+              warp_staging[ty][pos].distance = dist;
+              warp_staging[ty][pos].nodeid = static_cast<int>(cand);
+              warp_staging[ty][pos].checked = false;
+              warp_staging_sz[ty] = pos + 1;
             }
           }
         }
         __syncthreads();
         if (threadIdx.x == 0) {
-          topq_sz = min(topq_sz, TOPQ_SZ);
-          candq_sz = min(candq_sz, CANDQ_SZ);
-        }
-        __syncthreads();
-        bitonic_sort_pq(topq, topq_sz);
-        bitonic_sort_pq(candq, candq_sz);
-        if (threadIdx.x == 0) {
-          topq_sz = min(topq_sz, EFC);
-          topq_max = topq_sz > 0 ? topq[topq_sz - 1].distance : INFINITY;
+          merge_staged_neighbors_into_queues(
+              candq, &candq_sz, topq, &topq_sz, &topq_max, warp_staging, warp_staging_sz);
         }
         __syncthreads();
       }
+      __syncthreads();
+      bitonic_sort_pq(topq, topq_sz);
       __syncthreads();
       // prune the old vectors for the new
       prune_for_new_kernel(state, topq, topq_sz, bid, lv);
