@@ -1492,6 +1492,7 @@ __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
 __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv) {
   __shared__ uint32_t *visited;
   __shared__ uint32_t visited_tag;
+  __shared__ float query_vec[DIM];
   __shared__ Neighbor candq[CANDQ_SZ];
   __shared__ int candq_sz;
   __shared__ Neighbor topq[TOPQ_SZ];
@@ -1507,6 +1508,10 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
     const int tx = threadIdx.x % warpSize;
     const int ty = threadIdx.x / warpSize;
     const int nrow = blockDim.x / warpSize;
+
+    for (int j = threadIdx.x; j < DIM; j += blockDim.x) {
+      query_vec[j] = state->vector_data[vid * state->vector_dim + j];
+    }
 
     // Find the entry point
     if (threadIdx.x == 0) {
@@ -1540,9 +1545,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           uint32_t cand = datal[i];
           float dist = 0.0f;
           for (int j = tx; j < DIM; j += warpSize) {
-            dist +=
-                (state->vector_data[cand * state->vector_dim + j] - state->vector_data[vid * state->vector_dim + j]) *
-                (state->vector_data[cand * state->vector_dim + j] - state->vector_data[vid * state->vector_dim + j]);
+            const float diff =
+                state->vector_data[cand * state->vector_dim + j] - query_vec[j];
+            dist += diff * diff;
           }
           for (int lane = warpSize / 2; lane > 0; lane /= 2) {
             dist += __shfl_down_sync(0xffffffff, dist, lane);
@@ -1622,9 +1627,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           }
           float dist = 0.0f;
           for (int j = tx; j < DIM; j += warpSize) {
-            dist +=
-                (state->vector_data[cand * state->vector_dim + j] - state->vector_data[vid * state->vector_dim + j]) *
-                (state->vector_data[cand * state->vector_dim + j] - state->vector_data[vid * state->vector_dim + j]);
+            const float diff =
+                state->vector_data[cand * state->vector_dim + j] - query_vec[j];
+            dist += diff * diff;
           }
           for (int lane = warpSize / 2; lane > 0; lane /= 2) {
             dist += __shfl_down_sync(0xffffffff, dist, lane);
