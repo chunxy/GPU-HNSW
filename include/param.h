@@ -6,7 +6,7 @@ const int GRID_DIM = 32;
 const int GRID_DIM = 32;
 #endif
 
-const int BLOCK_DIM = 64;
+const int BLOCK_DIM = 128;
 
 const int BATCHSZ_PER_NEW = 256;
 
