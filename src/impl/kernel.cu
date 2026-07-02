@@ -1559,10 +1559,6 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
     __syncthreads();
     int lv = startup_lv - 1;
     while (lv > lvl) {
-      if (threadIdx.x == 0) {
-        changed = 1;
-      }
-      __syncthreads();
       while (1) {
         if (threadIdx.x == 0) {
           changed = 0;
@@ -1577,8 +1573,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           uint32_t cand = datal[i];
           float dist = 0.0f;
           for (int j = tx; j < DIM; j += warpSize) {
-            const float diff =
-                state->vector_data[cand * state->vector_dim + j] - query_vec[j];
+            const float diff = state->vector_data[cand * state->vector_dim + j] - query_vec[j];
             dist += diff * diff;
           }
           for (int lane = warpSize / 2; lane > 0; lane /= 2) {
@@ -1599,7 +1594,6 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         }
       }
       lv--;
-      __syncthreads();
     }
     // Search and insert at current level.
     while (lv >= 0) {
@@ -1620,11 +1614,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
 
       // Better not to do the beam search
       while (candq_sz > 0) {
-        __syncthreads();
         if (topq_sz >= EFC && candq[0].distance > topq_max) {
           break;
         }
-        __syncthreads();
 
         const int tx = threadIdx.x % warpSize;
         const int ty = threadIdx.x / warpSize;
@@ -1632,7 +1624,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
 
         Neighbor tmp{candq[0].distance, candq[0].nodeid, candq[0].checked};
         if (threadIdx.x == 0) {
-          atomicExch(&visited[tmp.nodeid], visited_tag);
+          visited[tmp.nodeid] = visited_tag;
           MinPqPop(candq, &candq_sz, &tmp);
         }
         __syncthreads();
@@ -1661,8 +1653,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           }
           float dist = 0.0f;
           for (int j = tx; j < DIM; j += warpSize) {
-            const float diff =
-                state->vector_data[cand * state->vector_dim + j] - query_vec[j];
+            const float diff = state->vector_data[cand * state->vector_dim + j] - query_vec[j];
             dist += diff * diff;
           }
           for (int lane = warpSize / 2; lane > 0; lane /= 2) {
@@ -1685,9 +1676,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         }
         __syncthreads();
       }
-      __syncthreads();
       bitonic_sort_pq(topq, topq_sz);
-      __syncthreads();
       // prune the old vectors for the new
       prune_for_new_kernel(state, topq, topq_sz, bid, lv);
 
@@ -1700,7 +1689,6 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         curr_obj_shared = datal[0];
         curr_dist_bits_shared = __float_as_int(distl[0]);
       }
-      __syncthreads();
       // add reverse edges for the old vectors
       for (int i = threadIdx.x; i < sz; i += blockDim.x) {
         uint32_t *other_linkl = lv == 0 ? get_linklist0(state, datal[i]) : get_linklist(state, datal[i], lv);
