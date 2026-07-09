@@ -22,6 +22,10 @@ const int EFC = 50;  // TODO: move to global
 
 const int TOPQ_SZ = EFC + 16;  // 16 for the max number of neighbors
 
+// Build-time link lists reserve maxM0 + BATCHSZ_PER_NEW (L0) or M + BATCHSZ_PER_NEW slots.
+// Lower-level search stages raw beam-search results there before finally_prune.
+const int MAX_LINK_M0_HEADROOM = 128;  // compile-time bound for maxM0 (= 2 * M)
+
 const int CANDQ_SZ = 200;
 
 // search_knn_at_lower_kernel: per-warp neighbor staging during beam search
@@ -32,3 +36,5 @@ static_assert(BATCHSZ_PER_NEW > GRID_DIM);
 static_assert(BATCHSZ_PER_OLD * GRID_DIM <= LEVEL_SZ_THRES);
 static_assert(DIM % 16 == 0);
 static_assert(BLOCK_DIM % 32 == 0);
+static_assert(TOPQ_SZ <= BATCHSZ_PER_NEW + MAX_LINK_M0_HEADROOM,
+              "TOPQ_SZ must fit in build-time link list capacity (maxM0 + BATCHSZ_PER_NEW)");
