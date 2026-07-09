@@ -361,22 +361,46 @@ __device__ void copy_float_to_half_kernel(GpuGraphState *state) {
   }
 }
 
-__device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv) {
-  int tid = threadIdx.x;
-  if (tid == 0) {
+__device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv, const cg::grid_group &grid) {
+  __shared__ uint32_t block_local_ids[LEVEL_SZ_THRES];
+  __shared__ uint32_t block_match_count;
+  __shared__ uint32_t block_write_base;
+
+  if (grid.thread_rank() == 0) {
     state->old_vec_fetch_offset = 0;
   }
-  for (int lv = tid; lv < MAX_HNSW_LEVEL; lv += blockDim.x) {
-    state->changed_old_link_counts[lv] = 0;
+  for (int level = grid.thread_rank(); level < MAX_HNSW_LEVEL; level += grid.size()) {
+    state->changed_old_link_counts[level] = 0;
+  }
+  grid.sync();
+
+  if (threadIdx.x == 0) {
+    block_match_count = 0;
   }
   __syncthreads();
-  for (int i = tid; i < state->cur_element_count; i += blockDim.x) {
+
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < state->cur_element_count; i += gridDim.x * blockDim.x) {
     if (state->element_levels[i] >= static_cast<int32_t>(lv)) {
-      const uint32_t offset = atomicAdd(&state->old_vec_fetch_offset, 1U);
-      state->old_vector_fetch_index[offset] = i;
+      const uint32_t pos = atomicAdd(&block_match_count, 1U);
+#ifndef NDEBUG
+      if (pos >= LEVEL_SZ_THRES) {
+        printf("Fatal: block %d aggregate overflow at level %d\n", blockIdx.x, lv);
+        assert(false);
+      }
+#endif
+      block_local_ids[pos] = static_cast<uint32_t>(i);
     }
   }
   __syncthreads();
+
+  if (threadIdx.x == 0) {
+    block_write_base = atomicAdd(&state->old_vec_fetch_offset, block_match_count);
+  }
+  __syncthreads();
+
+  for (uint32_t j = threadIdx.x; j < block_match_count; j += blockDim.x) {
+    state->old_vector_fetch_index[block_write_base + j] = block_local_ids[j];
+  }
 }
 
 // 1 block
@@ -1008,10 +1032,8 @@ __global__ void build_graph_kernel(GpuGraphState *state) {
     const int startup_level = min(hi, state->maxlevel);
 
     uint64_t phase_t0 = build_phase_begin(state, grid);
-    if (blockIdx.x == 0) {
-      // aggregate the old vectors available on the startup level
-      aggregate_on_level_kernel(state, startup_level);  // Reset per-level changed_old_link_counts by the way.
-    }
+    // aggregate the old vectors available on the startup level
+    aggregate_on_level_kernel(state, startup_level, grid);  // Reset per-level changed_old_link_counts by the way.
     build_phase_record(state, grid, kBuildPhaseAggregate, phase_t0);
     build_grid_sync(grid);
 
