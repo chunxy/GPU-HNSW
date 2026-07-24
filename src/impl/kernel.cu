@@ -1496,6 +1496,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
   __shared__ int curr_dist_bits_shared;
   __shared__ Neighbor warp_staging[SEARCH_WARP_COUNT][WARP_STAGING_CAP];
   __shared__ int warp_staging_sz[SEARCH_WARP_COUNT];
+  __shared__ float warp_best_dist[SEARCH_WARP_COUNT];
+  __shared__ uint32_t warp_best_cand[SEARCH_WARP_COUNT];
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
@@ -1532,6 +1534,12 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         uint32_t *linkl = size > 0 ? get_linklist(state, curr_obj_shared, lv) : nullptr;
         uint32_t *datal = size > 0 ? (uint32_t *)(linkl + 1) : nullptr;
 
+        float local_best;
+        uint32_t local_cand;
+        if (tx == 0) {
+          local_best = __int_as_float(curr_dist_bits_shared);
+          local_cand = curr_obj_shared;
+        }
         for (int i = ty; i < size; i += nrow) {
           uint32_t cand = datal[i];
           float dist = 0.0f;
@@ -1542,14 +1550,26 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           for (int lane = warpSize / 2; lane > 0; lane /= 2) {
             dist += __shfl_down_sync(0xffffffff, dist, lane);
           }
-          if (tx == 0) {
-            int dist_bits = __float_as_int(dist);
-            int old_best = atomicMin(&curr_dist_bits_shared, dist_bits);  // positive float trick
-            if (dist_bits < old_best) {
-              curr_obj_shared = cand;
-              atomicExch(&changed, 1);
+          if (tx == 0 && dist < local_best) {
+            local_best = dist;
+            local_cand = cand;
+          }
+        }
+        if (tx == 0) {
+          warp_best_dist[ty] = local_best;
+          warp_best_cand[ty] = local_cand;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          float curr_dist = __int_as_float(curr_dist_bits_shared);
+          for (int w = 0; w < SEARCH_WARP_COUNT; ++w) {
+            if (warp_best_dist[w] < curr_dist) {
+              curr_dist = warp_best_dist[w];
+              curr_obj_shared = warp_best_cand[w];
+              changed = 1;
             }
           }
+          curr_dist_bits_shared = __float_as_int(curr_dist);
         }
         __syncthreads();
         if (!changed) {
