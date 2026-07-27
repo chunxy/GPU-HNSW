@@ -994,6 +994,11 @@ class HierarchicalNswLite {
   void move_to_gpu() {
     release_gpu_state();
 
+    if (ef_construction_ > MAX_EFC) {
+      throw std::invalid_argument(
+          fmt::format("ef_construction {} exceeds GPU maximum {}", ef_construction_, MAX_EFC));
+    }
+
     const size_t cur_count = cur_element_count.load();
     const uint32_t gpu_cur_count = checked_u32(cur_count, "cur_element_count");
     const uint32_t gpu_max_elements = checked_u32(max_elements_, "max_elements");

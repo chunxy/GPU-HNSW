@@ -220,22 +220,23 @@ __device__ void merge_staged_neighbors_into_queues(
     int *topq_sz,
     float *topq_max,
     Neighbor (*warp_staging)[WARP_STAGING_CAP],
-    const int *warp_staging_sz) {
+    const int *warp_staging_sz,
+    const int ef_construction) {
   for (int w = 0; w < SEARCH_WARP_COUNT; ++w) {
     for (int i = 0; i < warp_staging_sz[w]; ++i) {
       const float dist = warp_staging[w][i].distance;
       const int nodeid = warp_staging[w][i].nodeid;
-      if (*topq_sz < EFC || dist < *topq_max) {
+      if (*topq_sz < ef_construction || dist < *topq_max) {
         if (*candq_sz < CANDQ_SZ) {
           MinPqPush(candq, candq_sz, dist, nodeid, false);
         }
         if (*topq_sz < TOPQ_SZ) {
           MaxPqPush(topq, topq_sz, dist, nodeid, true);
         }
-        while (*topq_sz > EFC) {
+        while (*topq_sz > ef_construction) {
           MaxPqPop(topq, topq_sz);
         }
-        if (*topq_sz >= EFC) {
+        if (*topq_sz >= ef_construction) {
           *topq_max = topq[0].distance;
         }
       }
@@ -1597,7 +1598,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
 
       // Better not to do the beam search
       while (candq_sz > 0) {
-        if (topq_sz >= EFC && candq[0].distance > topq_max) {
+        if (topq_sz >= state->ef_construction && candq[0].distance > topq_max) {
           break;
         }
 
@@ -1655,7 +1656,14 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         __syncthreads();
         if (threadIdx.x == 0) {
           merge_staged_neighbors_into_queues(
-              candq, &candq_sz, topq, &topq_sz, &topq_max, warp_staging, warp_staging_sz);
+              candq,
+              &candq_sz,
+              topq,
+              &topq_sz,
+              &topq_max,
+              warp_staging,
+              warp_staging_sz,
+              state->ef_construction);
         }
         __syncthreads();
       }

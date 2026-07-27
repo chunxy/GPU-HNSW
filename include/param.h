@@ -18,9 +18,10 @@ const int DIM = 128;
 
 const int MAX_HNSW_LEVEL = 32;
 
-const int EFC = 50;  // TODO: move to global
+// Largest ef_construction supported by GPU build kernels (sizes shared-memory top-q buffers).
+const int MAX_EFC = 50;
 
-const int TOPQ_SZ = EFC + 16;  // 16 for the max number of neighbors
+const int TOPQ_SZ = MAX_EFC + 16;  // 16 for the max number of neighbors
 
 // Build-time link lists reserve maxM0 + BATCHSZ_PER_NEW (L0) or M + BATCHSZ_PER_NEW slots.
 // Lower-level search stages raw beam-search results there before finally_prune.
