@@ -22,8 +22,8 @@ __device__ void build_phase_record(GpuGraphState *state, const cg::grid_group &g
 #ifdef PROFILE_BUILD_PHASES
   if (state->profile_build_phases && grid.thread_rank() == 0) {
     atomicAdd(
-        reinterpret_cast<unsigned long long *>(state->build_phase_cycles + static_cast<int>(phase)),
-        static_cast<unsigned long long>(clock64() - t0));
+        reinterpret_cast<unsigned long long *>(state->build_phase_cycles + phase),
+        clock64() - t0);
   }
 #else
   (void)state;
@@ -94,7 +94,7 @@ __device__ unsigned short int getListCount(uint32_t *ptr) { return *((uint32_t *
 __device__ void setListCount(uint32_t *ptr, unsigned short int size) { *((tableint *)ptr) = size; }
 
 __device__ uint32_t frozen_link_count_offset(GpuGraphState *state, uint32_t internal_id, int level) {
-  return static_cast<uint32_t>(level) * state->max_elements + internal_id;
+  return level * state->max_elements + internal_id;
 }
 
 __device__ uint32_t get_frozen_link_count(GpuGraphState *state, uint32_t internal_id, int level) {
@@ -106,11 +106,11 @@ __device__ uint32_t get_frozen_link_count(GpuGraphState *state, uint32_t interna
 }
 
 __device__ uint32_t changed_old_link_level_offset(GpuGraphState *state, int level) {
-  return static_cast<uint32_t>(level) * static_cast<uint32_t>(BATCHSZ_PER_NEW) * state->maxM0;
+  return level * BATCHSZ_PER_NEW * state->maxM0;
 }
 
 __device__ uint32_t changed_old_link_level_capacity(GpuGraphState *state) {
-  return static_cast<uint32_t>(BATCHSZ_PER_NEW) * state->maxM0;
+  return BATCHSZ_PER_NEW * state->maxM0;
 }
 
 __device__ void record_changed_old_link(GpuGraphState *state, uint32_t internal_id, int level) {
@@ -209,7 +209,7 @@ __device__ void find_closest_in_topq(const Neighbor *topq, int topq_sz, uint32_t
       best = i;
     }
   }
-  *out_id = static_cast<uint32_t>(topq[best].nodeid);
+  *out_id = topq[best].nodeid;
   *out_dist = topq[best].distance;
 }
 
@@ -315,7 +315,7 @@ __device__ void bitonic_sort_id_for_all_ll(GpuGraphState *state) {
     for (int lv = 0; lv <= state->element_levels[vid]; lv++) {
       uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
       const int len = getListCount(linkl);
-      if (len <= 1 || len == static_cast<int>(get_frozen_link_count(state, vid, lv))) continue;
+      if (len <= 1 || len == get_frozen_link_count(state, vid, lv)) continue;
       bitonic_sort(state, vid, lv);
     }
   }
@@ -381,7 +381,7 @@ __device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv, const cg
   __syncthreads();
 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < state->cur_element_count; i += gridDim.x * blockDim.x) {
-    if (state->element_levels[i] >= static_cast<int32_t>(lv)) {
+    if (state->element_levels[i] >= lv) {
       const uint32_t pos = atomicAdd(&block_match_count, 1U);
 #ifndef NDEBUG
       if (pos >= LEVEL_SZ_THRES) {
@@ -389,7 +389,7 @@ __device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv, const cg
         assert(false);
       }
 #endif
-      block_local_ids[pos] = static_cast<uint32_t>(i);
+      block_local_ids[pos] = i;
     }
   }
   __syncthreads();
@@ -485,7 +485,7 @@ __device__ void compute_dist_block_wmma(
   const int wmma_cols = (col_count / 16) * 16;
   for (uint32_t i = 0; i < row_count; ++i) {
     for (int j = threadIdx.x; j < col_count; j += blockDim.x) {
-      if (i < static_cast<uint32_t>(wmma_rows) && j < wmma_cols) continue;
+      if (i < wmma_rows && j < wmma_cols) continue;
       float ip = 0.0f;
       const int row_st = i * DIM;
       const int col_st = j * DIM;
@@ -566,8 +566,8 @@ __device__ void compute_new_new_dist_into_buffers(
   const int wmma_rows = (new_count / 16) * 16;
   const int wmma_cols = (new_count / 16) * 16;
   for (uint32_t i = 0; i < new_count; ++i) {
-    for (int j = threadIdx.x; j < static_cast<int>(new_count); j += blockDim.x) {
-      if (i < static_cast<uint32_t>(wmma_rows) && j < wmma_cols) continue;
+    for (int j = threadIdx.x; j < new_count; j += blockDim.x) {
+      if (i < wmma_rows && j < wmma_cols) continue;
       float ip = 0.0f;
       const int row_st = i * DIM;
       const int col_st = j * DIM;
@@ -581,13 +581,13 @@ __device__ void compute_new_new_dist_into_buffers(
 
   for (uint32_t i = 0; i < new_count; ++i) {
     const uint32_t one = batch_base + i;
-    for (int j = threadIdx.x; j < static_cast<int>(new_count); j += blockDim.x) {
-      const int out_idx = static_cast<int>(i) * dist_row_stride + j;
+    for (int j = threadIdx.x; j < new_count; j += blockDim.x) {
+      const int out_idx = i * dist_row_stride + j;
       float ip = dist_out[out_idx];
       dist_out[out_idx] = -2 * ip + state->vector_powers[one];
-      const uint32_t another = batch_base + static_cast<uint32_t>(j);
+      const uint32_t another = batch_base + j;
       dist_out[out_idx] += state->vector_powers[another];
-      rank_out[static_cast<int>(i) * rank_row_stride + j] = another;
+      rank_out[i * rank_row_stride + j] = another;
     }
   }
 }
@@ -597,16 +597,16 @@ __device__ void load_precomputed_new_new_dist(GpuGraphState *state) {
   const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   if (new_count == 0) return;
 
-  const size_t batch_offset = static_cast<size_t>(batch_id) * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
+  const size_t batch_offset = batch_id * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
   const float *src_dist = state->precomputed_new_new_dist + batch_offset;
   const uint32_t *src_rank = state->precomputed_new_new_rank + batch_offset;
   const int dst_row_stride = LEVEL_SZ_THRES + BATCHSZ_PER_NEW;
-  const int total = static_cast<int>(new_count) * static_cast<int>(new_count);
+  const int total = new_count * new_count;
 
-  for (int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
-       idx += static_cast<int>(gridDim.x) * blockDim.x) {
-    const int i = idx / static_cast<int>(new_count);
-    const int j = idx % static_cast<int>(new_count);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += gridDim.x * blockDim.x) {
+    const int i = idx / new_count;
+    const int j = idx % new_count;
     const int dst = i * dst_row_stride + LEVEL_SZ_THRES + j;
     const int src = i * BATCHSZ_PER_NEW + j;
     state->news_dist[dst] = src_dist[src];
@@ -620,7 +620,7 @@ __global__ void precompute_new_new_dist_kernel(GpuGraphState *state) {
   if (batch_base >= state->max_elements) return;
 
   const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - batch_base);
-  const size_t batch_offset = static_cast<size_t>(batch_id) * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
+  const size_t batch_offset = batch_id * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
   float *dist_out = state->precomputed_new_new_dist + batch_offset;
   uint32_t *rank_out = state->precomputed_new_new_rank + batch_offset;
   compute_new_new_dist_into_buffers(state, batch_base, new_count, dist_out, BATCHSZ_PER_NEW, rank_out, BATCHSZ_PER_NEW);
@@ -844,7 +844,7 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
 
       // prune all the candidates
       for (int i = threadIdx.x; i < sz; i += blockDim.x) {
-        if (ranked_cand[i] == static_cast<uint32_t>(vid) || state->element_levels[ranked_cand[i]] < lv) {
+        if (ranked_cand[i] == vid || state->element_levels[ranked_cand[i]] < lv) {
           pruned_mask[i] = 1;
         } else {
           pruned_mask[i] = 0;
@@ -953,7 +953,7 @@ __device__ void add_reverse_edges_for_new_at_lower_kernel(GpuGraphState *state, 
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
-    const int max_lv = min(startup_level - 1, static_cast<int>(state->element_levels[vid]));
+    const int max_lv = min(startup_level - 1, state->element_levels[vid]);
     for (int lv = 0; lv <= max_lv; ++lv) {
       uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
       const int sz = getListCount(linkl);
@@ -977,7 +977,7 @@ __device__ void add_reverse_edges_for_new_at_lower_kernel(GpuGraphState *state, 
           assert(false);
         }
 #endif
-        other_datal[pos] = static_cast<uint32_t>(vid);
+        other_datal[pos] = vid;
         other_distl[pos] = distl[i];
       }
       __syncthreads();
@@ -1163,10 +1163,10 @@ __device__ void generate_random_levels_kernel(GpuGraphState *state) {
   int wid = threadIdx.x + blockDim.x * blockIdx.x;
   while (wid < state->max_elements) {
     curandStatePhilox4_32_10_t rng_state;
-    curand_init(kRandomLevelSeed, static_cast<unsigned long long>(wid), 0, &rng_state);
+    curand_init(kRandomLevelSeed, wid, 0, &rng_state);
     float sample = fmaxf(curand_uniform(&rng_state), 1.0e-7f);
 
-    int32_t level = static_cast<int32_t>(-logf(sample) * state->mult);
+    int32_t level = -logf(sample) * state->mult;
     level = min(level, MAX_HNSW_LEVEL - 1);
     state->element_levels[wid] = level;
 
@@ -1245,7 +1245,7 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
     const int wmma_cols = (old_count / 16) * 16;
     for (uint32_t i = 0; i < new_count; ++i) {
       for (int local_j = threadIdx.x; local_j < old_count; local_j += blockDim.x) {
-        if (i < static_cast<uint32_t>(wmma_rows) && local_j < wmma_cols) continue;
+        if (i < wmma_rows && local_j < wmma_cols) continue;
         float ip = 0.0f;
         const int new_st = i * DIM;
         const int old_st = local_j * DIM;
@@ -1647,7 +1647,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
             const int pos = warp_staging_sz[ty];
             if (pos < WARP_STAGING_CAP) {
               warp_staging[ty][pos].distance = dist;
-              warp_staging[ty][pos].nodeid = static_cast<int>(cand);
+              warp_staging[ty][pos].nodeid = cand;
               warp_staging[ty][pos].checked = false;
               warp_staging_sz[ty] = pos + 1;
             }
@@ -1673,7 +1673,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
       float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
       const int write_sz = min(topq_sz, TOPQ_SZ);
       for (int i = threadIdx.x; i < write_sz; i += blockDim.x) {
-        datal[i] = static_cast<uint32_t>(topq[i].nodeid);
+        datal[i] = topq[i].nodeid;
         distl[i] = topq[i].distance;
       }
       if (threadIdx.x == 0) {
@@ -1683,7 +1683,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         curr_dist_bits_shared = __float_as_int(entry_dist);
 #ifndef NDEBUG
         const uint32_t capacity = lv == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
-        if (static_cast<uint32_t>(write_sz) > capacity) {
+        if (write_sz > capacity) {
           printf("Fatal: staged search results exceed link list capacity\n");
           assert(false);
         }
@@ -1713,11 +1713,11 @@ void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count) {
     return;
   }
 
-  const double cycles_per_ms = static_cast<double>(clock_rate_khz);
+  const double cycles_per_ms = clock_rate_khz;
   double total_ms = 0.0;
   double phase_ms[kBuildPhaseCount]{};
   for (int phase = 0; phase < kBuildPhaseCount; ++phase) {
-    phase_ms[phase] = static_cast<double>(cycles[phase]) / cycles_per_ms;
+    phase_ms[phase] = cycles[phase] / cycles_per_ms;
     total_ms += phase_ms[phase];
   }
 
@@ -1725,7 +1725,7 @@ void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count) {
       "build_graph_kernel phase profile ({} batches, {:.3f} ms measured, {:.3f} ms per batch):\n",
       batch_count,
       total_ms,
-      total_ms / static_cast<double>(batch_count));
+      total_ms / batch_count);
   for (int phase = 0; phase < kBuildPhaseCount; ++phase) {
     const double pct = total_ms > 0.0 ? (phase_ms[phase] * 100.0 / total_ms) : 0.0;
     fmt::print(
@@ -1733,7 +1733,7 @@ void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count) {
         build_phase_name(static_cast<BuildPhase>(phase)),
         phase_ms[phase],
         pct,
-        phase_ms[phase] / static_cast<double>(batch_count));
+        phase_ms[phase] / batch_count);
   }
 }
 #endif  // PROFILE_BUILD_PHASES
