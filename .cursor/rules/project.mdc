@@ -4,6 +4,13 @@ globs: src/**/*.cu, src/**/*.cpp, include/**/*.h, include/**/*.cuh, include/**/*
 alwaysApply: false
 ---
 
+This project moves the HNSW index construction onto the GPU. Its main contribution is to use the tensor core during the vector insertion step of index construction as much as possible so that the typical vector-matrix computation can be partially turned into matrix-matrix computation. To do so, the top-down greedy search way of finding entry point for a new vector in HNSW is changed to
+
+1. Compute the powers of norm for each vector in the static dataset so that the later computation only involves inner products. The distance between two vectors can be obtained from the powers of norm and the inner product.
+2. Start at a middle level with a moderate size where the inner products between those old vectors and the batch of new vectors can be efficiently computed;
+3. From the middle-level computation result, upper-level connections can be obtained by pruning because the vectors on each of the upper levels must exist on this middle level;
+4. The middle-level computation result also provides the nearest neighbor for each of the new vectors, best-first search and edge establishment on the lower levels can use this nearest neighbor as the entry point. Note that the vector-matrix computation cannot be avoided in the remaining step.
+
 ## Tech Stack
 
 - C++ (17+)
