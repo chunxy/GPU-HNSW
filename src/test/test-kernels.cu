@@ -11,7 +11,7 @@
 
 namespace {
 
-constexpr uint32_t kVectorDim = DIM;
+constexpr uint32_t kVectorDim = MAX_DIM;
 constexpr uint32_t kTrackedLevels = 128;
 
 void check_cuda(cudaError_t status, const char *expr) {

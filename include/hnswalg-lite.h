@@ -1003,6 +1003,14 @@ class HierarchicalNswLite {
     const uint32_t gpu_cur_count = checked_u32(cur_count, "cur_element_count");
     const uint32_t gpu_max_elements = checked_u32(max_elements_, "max_elements");
     const uint32_t gpu_vector_dim = checked_u32(data_size_ / sizeof(float), "vector_dim");
+    if (gpu_vector_dim > static_cast<uint32_t>(MAX_DIM)) {
+      throw std::invalid_argument(
+          fmt::format("vector dimension {} exceeds GPU maximum {}", gpu_vector_dim, MAX_DIM));
+    }
+    if (gpu_vector_dim % 16 != 0) {
+      throw std::invalid_argument(
+          fmt::format("vector dimension {} must be a multiple of 16 for GPU WMMA kernels", gpu_vector_dim));
+    }
     const uint32_t gpu_size_links_level0 =
         checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (maxM0_ + BATCHSZ_PER_NEW) * 2, "size_links_level0");
     const uint32_t gpu_size_links_per_element =

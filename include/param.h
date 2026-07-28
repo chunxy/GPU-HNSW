@@ -14,7 +14,8 @@ const int BATCHSZ_PER_OLD = 128;
 
 const int LEVEL_SZ_THRES = 4096;
 
-const int DIM = 128;
+// Largest vector dimension supported by GPU build kernels (sizes shared-memory vector buffers).
+const int MAX_DIM = 128;
 
 const int MAX_HNSW_LEVEL = 32;
 
@@ -35,7 +36,7 @@ const int WARP_STAGING_CAP = 16;  // >= ceil(maxM0 / SEARCH_WARP_COUNT); maxM0 i
 
 static_assert(BATCHSZ_PER_NEW > GRID_DIM);
 static_assert(BATCHSZ_PER_OLD * GRID_DIM <= LEVEL_SZ_THRES);
-static_assert(DIM % 16 == 0);
+static_assert(MAX_DIM % 16 == 0);
 static_assert(BLOCK_DIM % 32 == 0);
 static_assert(TOPQ_SZ <= BATCHSZ_PER_NEW + MAX_LINK_M0_HEADROOM,
               "TOPQ_SZ must fit in build-time link list capacity (maxM0 + BATCHSZ_PER_NEW)");
