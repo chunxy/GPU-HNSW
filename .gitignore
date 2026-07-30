@@ -7,3 +7,4 @@ logs/
 angle.cu
 compile.sh
 run.sh
+gt.sh

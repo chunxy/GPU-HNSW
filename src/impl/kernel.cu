@@ -1197,8 +1197,8 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
     __syncthreads();
 
     // compute new-old inner products using tensor core
+    // vector_dim is padded to a multiple of 16 on H2D (move_to_gpu).
     {
-      // TODO: need to pad the vector dimension to multiple of 16
       namespace wmma = nvcuda::wmma;
       constexpr int kWmmaM = 16;
       constexpr int kWmmaN = 16;

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -1002,14 +1003,15 @@ class HierarchicalNswLite {
     const size_t cur_count = cur_element_count.load();
     const uint32_t gpu_cur_count = checked_u32(cur_count, "cur_element_count");
     const uint32_t gpu_max_elements = checked_u32(max_elements_, "max_elements");
-    const uint32_t gpu_vector_dim = checked_u32(data_size_ / sizeof(float), "vector_dim");
-    if (gpu_vector_dim > static_cast<uint32_t>(MAX_DIM)) {
-      throw std::invalid_argument(
-          fmt::format("vector dimension {} exceeds GPU maximum {}", gpu_vector_dim, MAX_DIM));
-    }
-    if (gpu_vector_dim % 16 != 0) {
-      throw std::invalid_argument(
-          fmt::format("vector dimension {} must be a multiple of 16 for GPU WMMA kernels", gpu_vector_dim));
+    // Host vectors may have any dim; GPU WMMA needs K multiple of 16, so pad with zeros.
+    const uint32_t host_vector_dim = checked_u32(data_size_ / sizeof(float), "vector_dim");
+    const uint32_t gpu_vector_dim = (host_vector_dim + 15u) / 16u * 16u;
+    if (gpu_vector_dim > static_cast<uint32_t>(MAX_DIM) || gpu_vector_dim == 0) {
+      throw std::invalid_argument(fmt::format(
+          "vector dimension {} (padded to {}) exceeds GPU maximum {} or is zero",
+          host_vector_dim,
+          gpu_vector_dim,
+          MAX_DIM));
     }
     const uint32_t gpu_size_links_level0 =
         checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (maxM0_ + BATCHSZ_PER_NEW) * 2, "size_links_level0");
@@ -1019,23 +1021,44 @@ class HierarchicalNswLite {
     const size_t old_new_distances_count = (BATCHSZ_PER_NEW) * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
     const size_t num_new_new_batches = (gpu_max_elements + BATCHSZ_PER_NEW - 1) / BATCHSZ_PER_NEW;
     const size_t precomputed_new_new_count = num_new_new_batches * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
-
-    auto malloc_and_copy = [&](void **dst, const void *src, size_t bytes) {
-      if (bytes == 0) {
-        *dst = nullptr;
-        return;
-      }
-      cudaCheck(cudaMalloc(dst, bytes), "cudaMalloc", __FILE__, __LINE__);
-      cudaCheck(cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice), "cudaMemcpy", __FILE__, __LINE__);
-    };
+    const size_t gpu_vector_bytes =
+        static_cast<size_t>(gpu_max_elements) * static_cast<size_t>(gpu_vector_dim) * sizeof(float);
 
     try {
-      malloc_and_copy(
-          (void **)&host_gpu_graph_state_.vector_data,
-          static_cast<void *>(d_vector_data_),
-          gpu_max_elements * gpu_vector_dim * sizeof(float));
-      // host_gpu_graph_state_.level0_links = static_cast<char *>(d_level0_links_);
-      // host_gpu_graph_state_.vector_data = static_cast<const float *>(d_vector_data_);
+      cudaCheck(
+          cudaMalloc(reinterpret_cast<void **>(&host_gpu_graph_state_.vector_data), gpu_vector_bytes),
+          "cudaMalloc",
+          __FILE__,
+          __LINE__);
+      if (host_vector_dim == gpu_vector_dim) {
+        cudaCheck(
+            cudaMemcpy(
+                host_gpu_graph_state_.vector_data,
+                d_vector_data_,
+                gpu_vector_bytes,
+                cudaMemcpyHostToDevice),
+            "cudaMemcpy",
+            __FILE__,
+            __LINE__);
+      } else {
+        // Pad each vector to gpu_vector_dim with zeros so WMMA K tiles never read past real data.
+        std::vector<float> padded_host(static_cast<size_t>(gpu_max_elements) * gpu_vector_dim, 0.0f);
+        for (uint32_t i = 0; i < gpu_max_elements; ++i) {
+          std::memcpy(
+              padded_host.data() + static_cast<size_t>(i) * gpu_vector_dim,
+              d_vector_data_ + static_cast<size_t>(i) * host_vector_dim,
+              static_cast<size_t>(host_vector_dim) * sizeof(float));
+        }
+        cudaCheck(
+            cudaMemcpy(
+                host_gpu_graph_state_.vector_data,
+                padded_host.data(),
+                gpu_vector_bytes,
+                cudaMemcpyHostToDevice),
+            "cudaMemcpy",
+            __FILE__,
+            __LINE__);
+      }
 
       host_gpu_graph_state_.max_elements = gpu_max_elements;
       host_gpu_graph_state_.cur_element_count = gpu_cur_count;
@@ -1055,6 +1078,7 @@ class HierarchicalNswLite {
       host_gpu_graph_state_.maxlevel = maxlevel_;
       host_gpu_graph_state_.mult = static_cast<float>(mult_);
       host_gpu_graph_state_.revSize = static_cast<float>(revSize_);
+      // Padded dimension used as GPU vector stride (WMMA / half buffer layout).
       host_gpu_graph_state_.vector_dim = gpu_vector_dim;
 
       // GPU's own runtime states
@@ -1226,8 +1250,14 @@ class HierarchicalNswLite {
     if (cur_count > max_elements_) {
       throw std::runtime_error("copy_from_gpu received an invalid cur_element_count");
     }
-    if (host_gpu_graph_state_.vector_dim * sizeof(float) != data_size_) {
-      throw std::runtime_error("copy_from_gpu received an incompatible vector dimension");
+    const uint32_t host_vector_dim = checked_u32(data_size_ / sizeof(float), "vector_dim");
+    const uint32_t expected_gpu_vector_dim = (host_vector_dim + 15u) / 16u * 16u;
+    if (host_gpu_graph_state_.vector_dim != expected_gpu_vector_dim) {
+      throw std::runtime_error(fmt::format(
+          "copy_from_gpu received incompatible vector dimension: gpu={} expected_padded={} host={}",
+          host_gpu_graph_state_.vector_dim,
+          expected_gpu_vector_dim,
+          host_vector_dim));
     }
 
     cur_element_count = cur_count;

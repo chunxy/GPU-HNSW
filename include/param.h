@@ -1,7 +1,7 @@
 const int MAX_VISITED = 1000000;
 
 #ifndef NDEBUG
-const int GRID_DIM = 32;
+const int GRID_DIM = 16;
 #else
 const int GRID_DIM = 32;
 #endif
@@ -10,12 +10,12 @@ const int BLOCK_DIM = 256;
 
 const int BATCHSZ_PER_NEW = 512;
 
-const int BATCHSZ_PER_OLD = 128;
+const int BATCHSZ_PER_OLD = 16;
 
 const int LEVEL_SZ_THRES = 4096;
 
 // Largest vector dimension supported by GPU build kernels (sizes shared-memory vector buffers).
-const int MAX_DIM = 128;
+const int MAX_DIM = 1024;
 
 const int MAX_HNSW_LEVEL = 32;
 
