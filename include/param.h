@@ -36,6 +36,8 @@ const int WARP_STAGING_CAP = 16;  // >= ceil(maxM0 / SEARCH_WARP_COUNT); maxM0 i
 
 static_assert(BATCHSZ_PER_NEW > GRID_DIM);
 static_assert(BATCHSZ_PER_OLD * GRID_DIM <= LEVEL_SZ_THRES);
+static_assert(BATCHSZ_PER_NEW % 16 == 0); // ensure WMMA
+static_assert(BATCHSZ_PER_OLD % 16 == 0); // ensure WMMA
 static_assert(MAX_DIM % 16 == 0);
 static_assert(BLOCK_DIM % 32 == 0);
 static_assert(TOPQ_SZ <= BATCHSZ_PER_NEW + MAX_LINK_M0_HEADROOM,

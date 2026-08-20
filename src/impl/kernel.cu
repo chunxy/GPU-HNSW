@@ -632,7 +632,6 @@ cudaError_t launch_precompute_new_new_dist_kernel(GpuGraphState *state, uint32_t
 __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int startup_lvl) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ float prev_neighbor[MAX_DIM];
   __shared__ float prev_neigh_dist;
   __shared__ uint32_t curr_neigh_cnt;
   __shared__ uint32_t neigh_rank[BATCHSZ_PER_NEW];
@@ -671,10 +670,6 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
         }
       }
       __syncthreads();
-      for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
-        prev_neighbor[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
-      }
-      __syncthreads();
       int M = lv ? state->M : state->maxM0;
 
       while (curr_neigh_cnt < M) {
@@ -687,16 +682,18 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
           can_continue = 0;
         }
         __syncthreads();
+        const float *prev_vec = state->vector_data + prev_neigh_id * state->vector_dim;
         for (int i = ty; i < state->old_vec_fetch_offset; i += nrow) {
           if (i <= prev_neigh_rank) continue;
           if (pruned_mask[i] == 0) {
             can_continue = 1;
             float dist = 0.0f;
             int cand = ranked_cand[i];
+            const float *cand_vec = state->vector_data + cand * state->vector_dim;
             // TODO: warp-level sync
             for (int j = tx; j < state->vector_dim; j += warpSize) {
-              dist += (state->vector_data[cand * state->vector_dim + j] - prev_neighbor[j]) *
-                      (state->vector_data[cand * state->vector_dim + j] - prev_neighbor[j]);
+              float diff = cand_vec[j] - prev_vec[j];
+              dist += diff * diff;
             }
             for (int lane = warpSize / 2; lane > 0; lane /= 2) {
               dist += __shfl_down_sync(0xffffffff, dist, lane);
@@ -725,9 +722,6 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
           }
         }
         __syncthreads();
-        for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
-          prev_neighbor[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
-        }
       }
 
       // Still treat as 1d block, adding all the selected edges based on the result.
@@ -776,7 +770,6 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ float prev_neighbor[MAX_DIM];
   __shared__ float prev_neigh_dist;
   __shared__ uint32_t curr_neigh_cnt;
   __shared__ uint32_t neigh_rank[BATCHSZ_PER_NEW];
@@ -868,10 +861,6 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
         __syncthreads();
         continue;
       }
-      for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
-        prev_neighbor[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
-      }
-      __syncthreads();
       int M = lv ? state->M : state->maxM0;
 
       while (curr_neigh_cnt < M) {
@@ -884,15 +873,17 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
           can_continue = 0;
         }
         __syncthreads();
+        const float *prev_vec = state->vector_data + prev_neigh_id * state->vector_dim;
         for (int i = ty; i < sz; i += nrow) {
           if (i <= prev_neigh_rank) continue;
           if (pruned_mask[i] == 0) {
             can_continue = 1;
             float dist = 0.0f;
             int cand = ranked_cand[i];
+            const float *cand_vec = state->vector_data + cand * state->vector_dim;
             for (int j = tx; j < state->vector_dim; j += warpSize) {
-              dist += (state->vector_data[cand * state->vector_dim + j] - prev_neighbor[j]) *
-                      (state->vector_data[cand * state->vector_dim + j] - prev_neighbor[j]);
+              float diff = cand_vec[j] - prev_vec[j];
+              dist += diff * diff;
             }
             for (int lane = warpSize / 2; lane > 0; lane /= 2) {
               dist += __shfl_down_sync(0xffffffff, dist, lane);
@@ -919,10 +910,6 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
               break;
             }
           }
-        }
-        __syncthreads();
-        for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
-          prev_neighbor[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
         }
         __syncthreads();
       }
@@ -1238,16 +1225,18 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
     // handle tail rows/cols not covered by WMMA full tiles
     const int wmma_rows = (new_count / 16) * 16;
     const int wmma_cols = (old_count / 16) * 16;
-    for (uint32_t i = 0; i < new_count; ++i) {
-      for (int local_j = threadIdx.x; local_j < old_count; local_j += blockDim.x) {
-        if (i < wmma_rows && local_j < wmma_cols) continue;
-        float ip = 0.0f;
-        const int new_st = i * state->vector_dim;
-        const int old_st = local_j * MAX_DIM;
-        for (int k = 0; k < state->vector_dim; ++k) {
-          ip += __half2float(new_vector_store[new_st + k]) * __half2float(old_vector_store[old_st + k]);
+    if (new_count % 16 != 0 || old_count % 16 != 0) { // only the last batch may not be covered by WMMA tiling
+      for (uint32_t i = 0; i < new_count; ++i) {
+        for (int local_j = threadIdx.x; local_j < old_count; local_j += blockDim.x) {
+          if (i < wmma_rows && local_j < wmma_cols) continue;
+          float ip = 0.0f;
+          const int new_st = i * state->vector_dim;
+          const int old_st = local_j * MAX_DIM;
+          for (int k = 0; k < state->vector_dim; ++k) {
+            ip += __half2float(new_vector_store[new_st + k]) * __half2float(old_vector_store[old_st + k]);
+          }
+          state->news_dist[i * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + oid + local_j] = ip;
         }
-        state->news_dist[i * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + oid + local_j] = ip;
       }
     }
     __syncthreads();
@@ -1273,7 +1262,6 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
 __device__ void prune_neighbors_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ float prev_neigh[MAX_DIM];
   __shared__ float prev_neigh_dist;
   __shared__ uint32_t curr_neigh_cnt;
   __shared__ unsigned char pruned_mask[BATCHSZ_PER_OLD + BATCHSZ_PER_NEW];
@@ -1305,9 +1293,6 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
         for (int i = threadIdx.x; i < sz; i += blockDim.x) {
           pruned_mask[i] = 0;
         }
-        for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
-          prev_neigh[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
-        }
         __syncthreads();
 
         while (curr_neigh_cnt < M) {
@@ -1318,6 +1303,7 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
           const int tx = threadIdx.x % warpSize;  // compute distance along this dimension
           const int ty = threadIdx.x / warpSize;  // compute for different candidates
           const int nrow = blockDim.x / warpSize;
+          const float *prev_vec = state->vector_data + prev_neigh_id * state->vector_dim;
 
           for (int i = ty; i < sz; i += nrow) {
             if (i <= prev_neigh_rank) continue;
@@ -1325,9 +1311,10 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
               can_continue = 1;
               float dist = 0.0f;
               const int cand = datal[i];
+              const float *cand_vec = state->vector_data + cand * state->vector_dim;
               for (int j = tx; j < state->vector_dim; j += warpSize) {
-                dist += (state->vector_data[cand * state->vector_dim + j] - prev_neigh[j]) *
-                        (state->vector_data[cand * state->vector_dim + j] - prev_neigh[j]);
+                float diff = cand_vec[j] - prev_vec[j];
+                dist += diff * diff;
               }
               for (int lane = warpSize / 2; lane > 0; lane /= 2) {
                 dist += __shfl_down_sync(0xffffffff, dist, lane);
@@ -1356,10 +1343,6 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
             }
           }
           __syncthreads();
-          for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
-            prev_neigh[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
-          }
-          __syncthreads();
         }
 
         if (threadIdx.x == 0) {
@@ -1377,7 +1360,6 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
 __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ float prev_neigh[MAX_DIM];
   __shared__ float prev_neigh_dist;
   __shared__ uint32_t curr_neigh_cnt;
   __shared__ unsigned char pruned_mask[BATCHSZ_PER_OLD + BATCHSZ_PER_NEW];
@@ -1407,9 +1389,6 @@ __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
         for (int i = threadIdx.x; i < sz; i += blockDim.x) {
           pruned_mask[i] = 0;
         }
-        for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
-          prev_neigh[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
-        }
         __syncthreads();
 
         while (curr_neigh_cnt < M) {
@@ -1420,6 +1399,7 @@ __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
           const int tx = threadIdx.x % warpSize;  // compute distance along this dimension
           const int ty = threadIdx.x / warpSize;  // compute for different candidates
           const int nrow = blockDim.x / warpSize;
+          const float *prev_vec = state->vector_data + prev_neigh_id * state->vector_dim;
 
           for (int i = ty; i < sz; i += nrow) {
             if (i <= prev_neigh_rank) continue;
@@ -1427,9 +1407,10 @@ __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
               can_continue = 1;
               float dist = 0.0f;
               const int cand = datal[i];
+              const float *cand_vec = state->vector_data + cand * state->vector_dim;
               for (int j = tx; j < state->vector_dim; j += warpSize) {
-                dist += (state->vector_data[cand * state->vector_dim + j] - prev_neigh[j]) *
-                        (state->vector_data[cand * state->vector_dim + j] - prev_neigh[j]);
+                float diff = cand_vec[j] - prev_vec[j];
+                dist += diff * diff;
               }
               for (int lane = warpSize / 2; lane > 0; lane /= 2) {
                 dist += __shfl_down_sync(0xffffffff, dist, lane);
@@ -1458,10 +1439,6 @@ __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
             }
           }
           __syncthreads();
-          for (int i = threadIdx.x; i < state->vector_dim; i += blockDim.x) {
-            prev_neigh[i] = state->vector_data[prev_neigh_id * state->vector_dim + i];
-          }
-          __syncthreads();
         }
 
         if (threadIdx.x == 0) {
@@ -1481,7 +1458,6 @@ __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
 __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv) {
   __shared__ uint32_t *visited;
   __shared__ uint32_t visited_tag;
-  __shared__ float query_vec[MAX_DIM];
   __shared__ Neighbor candq[CANDQ_SZ];
   __shared__ int candq_sz;
   __shared__ Neighbor topq[TOPQ_SZ];
@@ -1502,10 +1478,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
     const int ty = threadIdx.x / warpSize;
     const int nrow = blockDim.x / warpSize;
 
-    for (int j = threadIdx.x; j < state->vector_dim; j += blockDim.x) {
-      query_vec[j] = state->vector_data[vid * state->vector_dim + j];
-    }
-
+    float *query_vec = state->vector_data + vid * state->vector_dim;
     // Find the entry point
     if (threadIdx.x == 0) {
       auto ranks = state->news_rank + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
