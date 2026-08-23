@@ -19,4 +19,5 @@ CompileFlags:
     "-Xcompiler=-fvisibility=hidden",
     "-rdc=true",
     "-G",
+    "--ptxas-options=-v"
   ]
