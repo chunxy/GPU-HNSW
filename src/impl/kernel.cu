@@ -1009,44 +1009,53 @@ __global__ void build_graph_kernel(GpuGraphState *state) {
     const int startup_level = min(hi, state->maxlevel);
 
     uint64_t phase_t0 = build_phase_begin(state, grid);
-    // aggregate the old vectors available on the startup level
-    aggregate_on_level_kernel(state, startup_level, grid);  // Reset per-level changed_old_link_counts by the way.
+    // Aggregate the old vectors available on the startup level.
+    // Reset per-level changed_old_link_counts by the way.
+    aggregate_on_level_kernel(state, startup_level, grid);
     build_phase_record(state, grid, kBuildPhaseAggregate, phase_t0);
     build_grid_sync(grid);
 
     phase_t0 = build_phase_begin(state, grid);
+    // Compute the distances between the new vectors and the old vectors.
     compute_dist_with_old_kernel(state);
     build_phase_record(state, grid, kBuildPhaseDistOldNew, phase_t0);
 
     phase_t0 = build_phase_begin(state, grid);
+    // Load the precomputed distances between the new vectors for this batch.
     load_precomputed_new_new_dist(state);
     build_phase_record(state, grid, kBuildPhaseLoadNewNew, phase_t0);
     build_grid_sync(grid);
 
     phase_t0 = build_phase_begin(state, grid);
-    // for the new vectors, sort old vectors by distance
+    // For the new vectors, sort the aggregated old vectors by distance
     bitonic_sort_id_by_dis(state);
     build_phase_record(state, grid, kBuildPhaseSortOldByDist, phase_t0);
 
     phase_t0 = build_phase_begin(state, grid);
-    // connect the new vectors to only the old vectors in upper levels
+    // Connect the new vectors to the old vectors at upper levels (>= startup_level).
     connect_new_to_old_at_upper_kernel(state, startup_level);
     build_phase_record(state, grid, kBuildPhaseConnectUpper, phase_t0);
     build_grid_sync(grid);
 
+    // Connect the new vectors to the old vectors at lower levels (< startup_level).
+
     phase_t0 = build_phase_begin(state, grid);
-    // connect the new vectors to the old vectors in lower levels
-    snapshot_frozen_link_counts_kernel(state, startup_level - 1);
+    // Freeze the link counts at lower levels (< startup_level)
+    // so that new vectors won't process the added reverse edges in current batch.
+    snapshot_frozen_link_counts_kernel(state, startup_level);
     build_phase_record(state, grid, kBuildPhaseSnapshotFrozen, phase_t0);
     build_grid_sync(grid);
 
     phase_t0 = build_phase_begin(state, grid);
+    // Search the KNN for the new vectors at lower levels (< startup_level).
+    // Store for new vectors all the intermediate results (up to TOPQ_SZ) for the next phase.
     search_knn_at_lower_kernel(state, startup_level);
     build_phase_record(state, grid, kBuildPhaseSearchLower, phase_t0);
 
     phase_t0 = build_phase_begin(state, grid);
-    // for the new vectors, combine and sort old and new vectors by distance
+    // For the new vectors, combine and sort the old and new vectors by distance
     finally_prune_for_new_kernel(state);
+    // Unfreeze reverse edges at lower levels (< startup_level) by adding reverse edges.
     add_reverse_edges_for_new_at_lower_kernel(state, startup_level);
     build_phase_record(state, grid, kBuildPhaseFinallyPruneNew, phase_t0);
     // Wait for every block to finish those global mutations before any block
@@ -1057,7 +1066,8 @@ __global__ void build_graph_kernel(GpuGraphState *state) {
     phase_t0 = build_phase_begin(state, grid);
     // Sort and prune only old-node lists that received reverse edges in this batch.
     bitonic_sort_id_for_ll(state);
-    prune_neighbors_kernel(state);  // Update frozen link counts for the levels that received reverse edges.
+    // Update frozen link counts for the levels that received reverse edges.
+    prune_neighbors_kernel(state);
     build_phase_record(state, grid, kBuildPhaseSortPruneOld, phase_t0);
     build_grid_sync(grid);
 
