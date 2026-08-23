@@ -50,6 +50,9 @@ struct GpuGraphState {
   // runtime states shared by all threads on GPU
   // no need to maintain on CPU
   uint32_t *old_vector_fetch_index{nullptr};
+  // Dense old-vector panel for WMMA B: packed_old_vectors[i * vector_dim + d]
+  // is component d of old_vector_fetch_index[i]. Sized LEVEL_SZ_THRES * vector_dim.
+  half *old_vector_store{nullptr};
   uint32_t old_vec_fetch_offset{0};
   uint32_t *level_counts{nullptr};
   float *vector_powers{nullptr};

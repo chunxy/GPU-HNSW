@@ -1172,8 +1172,8 @@ __device__ void generate_random_levels_kernel(GpuGraphState *state) {
 
 // 1d grid, 1d block, 1 block per batch of old vectors
 __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
-  __shared__ __align__(32) half old_vector_store[BATCHSZ_PER_OLD * MAX_DIM];
   half *new_vector_store = state->half_vector_data + state->cur_element_count * state->vector_dim;
+  half *old_vector_store = state->old_vector_store;
 
   for (int bid = blockIdx.x; bid * BATCHSZ_PER_OLD < state->old_vec_fetch_offset; bid += gridDim.x) {
     // load old vectors
@@ -1185,7 +1185,7 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
     }
     for (uint32_t i = 0; i < old_count; ++i) {
       const uint32_t vector_st = state->old_vector_fetch_index[i + oid] * state->vector_dim;
-      const uint32_t old_vector_store_st = i * MAX_DIM;
+      const uint32_t old_vector_store_st = (i + oid) * state->vector_dim;
       for (int j = threadIdx.x; j < state->vector_dim; j += blockDim.x) {
         old_vector_store[old_vector_store_st + j] = state->half_vector_data[vector_st + j];
       }
@@ -1220,9 +1220,9 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
             wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK, half, wmma::row_major> a_frag;
             wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK, half, wmma::col_major> b_frag;
             const half *a_ptr = new_vector_store + new_row * state->vector_dim + k;
-            const half *b_ptr = old_vector_store + old_col * MAX_DIM + k;
+            const half *b_ptr = old_vector_store + (oid + old_col) * state->vector_dim + k;
             wmma::load_matrix_sync(a_frag, a_ptr, state->vector_dim);
-            wmma::load_matrix_sync(b_frag, b_ptr, MAX_DIM);
+            wmma::load_matrix_sync(b_frag, b_ptr, state->vector_dim);
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
           }
 
@@ -1235,13 +1235,13 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
     // handle tail rows/cols not covered by WMMA full tiles
     const int wmma_rows = (new_count / 16) * 16;
     const int wmma_cols = (old_count / 16) * 16;
-    if (new_count % 16 != 0 || old_count % 16 != 0) { // only the last batch may not be covered by WMMA tiling
+    if (new_count % 16 != 0 || old_count % 16 != 0) {  // only the last batch may not be covered by WMMA tiling
       for (uint32_t i = 0; i < new_count; ++i) {
         for (int local_j = threadIdx.x; local_j < old_count; local_j += blockDim.x) {
           if (i < wmma_rows && local_j < wmma_cols) continue;
           float ip = 0.0f;
           const int new_st = i * state->vector_dim;
-          const int old_st = local_j * MAX_DIM;
+          const int old_st = (oid + local_j) * state->vector_dim;
           for (int k = 0; k < state->vector_dim; ++k) {
             ip += __half2float(new_vector_store[new_st + k]) * __half2float(old_vector_store[old_st + k]);
           }
