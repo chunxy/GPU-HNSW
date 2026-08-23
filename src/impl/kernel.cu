@@ -963,11 +963,11 @@ __device__ void add_reverse_edges_for_new_at_lower_kernel(GpuGraphState *state, 
 
 __device__ void snapshot_frozen_link_counts_kernel(GpuGraphState *state, int max_level) {
   if (max_level < 0) return;
-  max_level = min(max_level, state->maxlevel);
+  max_level = min(max_level - 1, state->maxlevel);
   const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   const uint32_t node_count = min(state->max_elements, state->cur_element_count + new_count);
 
-  for (int lv = 0; lv <= max_level; ++lv) {
+  for (int lv = 0; lv < max_level; ++lv) {
     for (uint32_t node_id = threadIdx.x + blockIdx.x * blockDim.x; node_id < node_count;
          node_id += blockDim.x * gridDim.x) {
       uint32_t count = 0;
