@@ -78,12 +78,17 @@ __device__ float *get_linklist_dist(GpuGraphState *state, uint32_t internal_id, 
                    sizeof(linklistsizeint) + (state->M + BATCHSZ_PER_NEW) * sizeof(uint32_t));
 }
 
+__device__ char *level0_link_bytes(GpuGraphState *state, uint32_t internal_id) {
+  // size_links_level0 is ~4 KiB; uint32_t id * size wraps past ~1e6 vectors.
+  return state->level0_links + static_cast<size_t>(internal_id) * static_cast<size_t>(state->size_links_level0);
+}
+
 __device__ uint32_t *get_linklist0(GpuGraphState *state, uint32_t internal_id) {
-  return (uint32_t *)(state->level0_links + internal_id * state->size_links_level0);
+  return (uint32_t *)level0_link_bytes(state, internal_id);
 }
 
 __device__ float *get_linklist_dist0(GpuGraphState *state, uint32_t internal_id) {
-  return (float *)(state->level0_links + internal_id * state->size_links_level0 + sizeof(linklistsizeint) +
+  return (float *)(level0_link_bytes(state, internal_id) + sizeof(linklistsizeint) +
                    (state->maxM0 + BATCHSZ_PER_NEW) * sizeof(uint32_t));
 }
 
