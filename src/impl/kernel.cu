@@ -402,25 +402,25 @@ __device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv, const cg
 
 // 1 block
 __device__ void update_level_counts_kernel(GpuGraphState *state) {
-  const int MAX_LEVEL = 128;  // TODO: move to global
-  __shared__ uint32_t local_level_count[MAX_LEVEL];
-  for (int i = threadIdx.x; i < MAX_LEVEL; i += blockDim.x) {
+  __shared__ uint32_t local_level_count[MAX_HNSW_LEVEL];
+  for (int i = threadIdx.x; i < MAX_HNSW_LEVEL; i += blockDim.x) {
     local_level_count[i] = 0;
   }
   __syncthreads();
 
   int ed = min(state->cur_element_count + BATCHSZ_PER_NEW, state->max_elements);
   for (int i = state->cur_element_count + threadIdx.x; i < ed; i += blockDim.x) {
-    int level = state->element_levels[i];
-    for (int j = 0; j <= level; j++) {
-      atomicAdd(&local_level_count[j], 1);
-    }
+    uint32_t level = state->element_levels[i];
+    atomicAdd(&local_level_count[level], 1);
   }
   __syncthreads();
 
   if (threadIdx.x == 0) {
-    for (int i = 0; i < MAX_LEVEL; i++) {
-      atomicAdd(&state->level_counts[i], local_level_count[i]);
+    for (int i = MAX_HNSW_LEVEL - 2; i >= 0; --i) {
+      local_level_count[i] += local_level_count[i + 1];
+    }
+    for (int i = 0; i < MAX_HNSW_LEVEL; ++i) {
+      state->level_counts[i] += local_level_count[i];
     }
   }
 }
