@@ -1467,6 +1467,15 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
   __shared__ float warp_best_dist[SEARCH_WARP_COUNT];
   __shared__ uint32_t warp_best_cand[SEARCH_WARP_COUNT];
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
+  if (threadIdx.x == 0) {
+    visited = state->visited + blockIdx.x * state->max_elements;
+    visited_tag = 0;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < state->max_elements; i += blockDim.x) {
+    visited[i] = -1;
+  }
+  __syncthreads();
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
     const int lvl = state->element_levels[vid];
@@ -1481,12 +1490,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
       auto dists = state->news_dist + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
       curr_obj_shared = ranks[0];
       curr_dist_bits_shared = __float_as_int(dists[0]);
-      visited = state->visited + blockIdx.x * state->max_elements;
-      if (bid == blockIdx.x) {
-        visited_tag = 0;
-      }
     }
     __syncthreads();
+
     int lv = startup_lv - 1;
     while (lv > lvl) {
       while (1) {
