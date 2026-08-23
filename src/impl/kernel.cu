@@ -632,7 +632,6 @@ cudaError_t launch_precompute_new_new_dist_kernel(GpuGraphState *state, uint32_t
 __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int startup_lvl) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ float prev_neigh_dist;
   __shared__ uint32_t curr_neigh_cnt;
   __shared__ uint32_t neigh_rank[BATCHSZ_PER_NEW];
   __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
@@ -657,11 +656,10 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 
       if (threadIdx.x == 0) {
         curr_neigh_cnt = 0;
-        for (int i = 1; i < state->old_vec_fetch_offset; i++) {
+        for (int i = 0; i < state->old_vec_fetch_offset; i++) {
           if (pruned_mask[i] == 0) {
             prev_neigh_rank = i;
             prev_neigh_id = ranked_cand[i];
-            prev_neigh_dist = ranked_dist[i];
             neigh_rank[0] = prev_neigh_rank;
             curr_neigh_cnt = 1;
             pruned_mask[i] = 1;
@@ -713,7 +711,6 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
             if (pruned_mask[i] == 0) {
               prev_neigh_rank = i;
               prev_neigh_id = ranked_cand[i];
-              prev_neigh_dist = ranked_dist[i];
               neigh_rank[curr_neigh_cnt] = i;
               curr_neigh_cnt++;
               pruned_mask[i] = 1;
@@ -770,7 +767,6 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ float prev_neigh_dist;
   __shared__ uint32_t curr_neigh_cnt;
   __shared__ uint32_t neigh_rank[BATCHSZ_PER_NEW];
   __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
@@ -845,7 +841,6 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
           if (pruned_mask[i] == 0) {
             prev_neigh_rank = i;
             prev_neigh_id = ranked_cand[i];
-            prev_neigh_dist = ranked_dist[i];
             neigh_rank[0] = prev_neigh_rank;
             curr_neigh_cnt = 1;
             pruned_mask[i] = 1;
@@ -903,7 +898,6 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
             if (pruned_mask[i] == 0) {
               prev_neigh_rank = i;
               prev_neigh_id = ranked_cand[i];
-              prev_neigh_dist = ranked_dist[i];
               neigh_rank[curr_neigh_cnt] = i;
               curr_neigh_cnt++;
               pruned_mask[i] = 1;
@@ -919,10 +913,10 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
         datal[i] = ranked_cand[neigh_rank[i]];
         distl[i] = ranked_dist[neigh_rank[i]];
       }
-      __syncthreads();
       if (threadIdx.x == 0) {
         setListCount(linkl, curr_neigh_cnt);
       }
+      __syncthreads();
     }
   }
 }
@@ -1257,14 +1251,13 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
   }
 }
 
-// 1 block for 1 (old) vector
+// 1 block for 1 old vector
 // assume that neighbor list has been sorted
 __device__ void prune_neighbors_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ float prev_neigh_dist;
   __shared__ uint32_t curr_neigh_cnt;
-  __shared__ unsigned char pruned_mask[BATCHSZ_PER_OLD + BATCHSZ_PER_NEW];
+  __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
   __shared__ bool can_continue;
 
   for (int lv = 0; lv <= state->maxlevel; ++lv) {
@@ -1283,9 +1276,7 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
         if (threadIdx.x == 0) {
           prev_neigh_rank = 0;
           prev_neigh_id = datal[0];
-          prev_neigh_dist = distl[0];
           datal[0] = prev_neigh_id;
-          distl[0] = prev_neigh_dist;
           curr_neigh_cnt = 1;
         }
         __syncthreads();
@@ -1319,7 +1310,7 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
               for (int lane = warpSize / 2; lane > 0; lane /= 2) {
                 dist += __shfl_down_sync(0xffffffff, dist, lane);
               }
-              if (tx == 0 && dist < prev_neigh_dist) {
+              if (tx == 0 && dist < distl[i]) {
                 pruned_mask[i] = 1;
               }
             }
@@ -1333,9 +1324,8 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
               if (pruned_mask[i] == 0) {
                 prev_neigh_rank = i;
                 prev_neigh_id = datal[i];
-                prev_neigh_dist = distl[i];
-                distl[curr_neigh_cnt] = prev_neigh_dist;
-                datal[curr_neigh_cnt] = prev_neigh_id;
+                distl[curr_neigh_cnt] = distl[i];
+                datal[curr_neigh_cnt] = datal[i];
                 curr_neigh_cnt++;
                 pruned_mask[i] = 1;
                 break;
