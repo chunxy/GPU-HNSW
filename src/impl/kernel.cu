@@ -1088,6 +1088,12 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
   void *args[] = {&state};
   dim3 gridDim(GRID_DIM);
   dim3 blockDim(BLOCK_DIM);
+
+  int max_active_blocks = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks, build_graph_kernel, BLOCK_DIM, 0);
+  printf("Max resident blocks per SM: %d\n", max_active_blocks);
+  fflush(stdout);
+
   cudaLaunchCooperativeKernel((void *)build_graph_kernel, gridDim, blockDim, args);
   return cudaGetLastError();
 }
