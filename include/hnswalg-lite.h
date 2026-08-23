@@ -25,16 +25,9 @@ namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
-static uint32_t checked_u32(size_t value, const char *name) {
+static uint32_t checked_u32(size_t value) {
   if (value > std::numeric_limits<uint32_t>::max()) {
-    throw std::overflow_error(std::string(name) + " exceeds the 32-bit GPU limit");
-  }
-  return static_cast<uint32_t>(value);
-}
-
-static uint32_t checked_label_u32(labeltype value, const char *name) {
-  if (value > static_cast<labeltype>(std::numeric_limits<uint32_t>::max())) {
-    throw std::overflow_error(std::string(name) + " exceeds the 32-bit GPU limit");
+    throw std::overflow_error("value exceeds the 32-bit limit");
   }
   return static_cast<uint32_t>(value);
 }
@@ -111,10 +104,8 @@ class HierarchicalNswLite {
   GpuGraphState *device_gpu_graph_state_{nullptr};
 
   GpuGraphState host_gpu_graph_state_{};
-  float *d_vector_data_{nullptr};
+  float *vector_data_{nullptr};
 
-  GpuFreeFn gpu_free_fn_{nullptr};
-  bool gpu_graph_ready_{false};
   bool profile_build_phases_{false};
 
   HierarchicalNswLite(SpaceInterface<dist_t> *s) {}
@@ -227,7 +218,7 @@ class HierarchicalNswLite {
     mult_ = 1 / log(1.0 * M_);
     revSize_ = 1.0 / mult_;
 
-    d_vector_data_ = vector_data;
+    vector_data_ = vector_data;
   }
 
   ~HierarchicalNswLite() { clear(); }
@@ -253,26 +244,21 @@ class HierarchicalNswLite {
   };
 
   void release_gpu_state() {
-    if (gpu_free_fn_ != nullptr) {
 #ifdef PROFILE_BUILD_PHASES
-      gpu_free_fn_(host_gpu_graph_state_.build_phase_cycles);
+    cuda_free_buffer(host_gpu_graph_state_.build_phase_cycles);
 #endif
-      gpu_free_fn_(host_gpu_graph_state_.precomputed_new_new_dist);
-      gpu_free_fn_(host_gpu_graph_state_.precomputed_new_new_rank);
-      gpu_free_fn_(host_gpu_graph_state_.news_dist);
-      gpu_free_fn_(host_gpu_graph_state_.news_rank);
-      gpu_free_fn_(host_gpu_graph_state_.frozen_link_counts);
-      gpu_free_fn_(host_gpu_graph_state_.changed_old_links);
-      gpu_free_fn_(host_gpu_graph_state_.changed_old_link_counts);
-      gpu_free_fn_(host_gpu_graph_state_.old_vector_store);
-      gpu_free_fn_(device_gpu_graph_state_);
-      // gpu_free_fn_(host_gpu_graph_state_.half_vector_data_);
-    }
+    cuda_free_buffer(host_gpu_graph_state_.precomputed_new_new_dist);
+    cuda_free_buffer(host_gpu_graph_state_.precomputed_new_new_rank);
+    cuda_free_buffer(host_gpu_graph_state_.news_dist);
+    cuda_free_buffer(host_gpu_graph_state_.news_rank);
+    cuda_free_buffer(host_gpu_graph_state_.frozen_link_counts);
+    cuda_free_buffer(host_gpu_graph_state_.changed_old_links);
+    cuda_free_buffer(host_gpu_graph_state_.changed_old_link_counts);
+    cuda_free_buffer(host_gpu_graph_state_.old_vector_store);
+    cuda_free_buffer(device_gpu_graph_state_);
 
     device_gpu_graph_state_ = nullptr;
     host_gpu_graph_state_ = GpuGraphState{};
-    gpu_free_fn_ = nullptr;
-    gpu_graph_ready_ = false;
   }
 
   const GpuGraphState &gpu_graph_state() const { return host_gpu_graph_state_; }
@@ -1001,157 +987,117 @@ class HierarchicalNswLite {
     release_gpu_state();
 
     if (ef_construction_ > MAX_EFC) {
-      throw std::invalid_argument(fmt::format("ef_construction {} exceeds GPU maximum {}", ef_construction_, MAX_EFC));
+      throw std::invalid_argument(fmt::format("ef_construction exceeds GPU maximum"));
     }
 
-    const size_t cur_count = cur_element_count.load();
-    const uint32_t gpu_cur_count = checked_u32(cur_count, "cur_element_count");
-    const uint32_t gpu_max_elements = checked_u32(max_elements_, "max_elements");
+    const uint32_t gpu_max_elements = checked_u32(max_elements_);
     // Host vectors may have any dim; GPU WMMA needs K multiple of 16, so pad with zeros.
-    const uint32_t host_vector_dim = checked_u32(data_size_ / sizeof(float), "vector_dim");
+    const uint32_t host_vector_dim = checked_u32(data_size_ / sizeof(float));
     const uint32_t gpu_vector_dim = (host_vector_dim + 15u) / 16u * 16u;
-    if (gpu_vector_dim > static_cast<uint32_t>(MAX_DIM) || gpu_vector_dim == 0) {
-      throw std::invalid_argument(
-          fmt::format(
-              "vector dimension {} (padded to {}) exceeds GPU maximum {} or is zero",
-              host_vector_dim,
-              gpu_vector_dim,
-              MAX_DIM));
+    if (gpu_vector_dim > MAX_DIM) {
+      throw std::invalid_argument(fmt::format("vector dimension exceeds GPU maximum"));
     }
+    const size_t gpu_vector_bytes = gpu_max_elements * gpu_vector_dim * sizeof(float);
+    gpuMalloc(&host_gpu_graph_state_.vector_data, gpu_vector_bytes);
+    if (host_vector_dim == gpu_vector_dim) {
+      CUDA_CHECK(cudaMemcpy(host_gpu_graph_state_.vector_data, vector_data_, gpu_vector_bytes, cudaMemcpyHostToDevice));
+    } else {
+      std::vector<float> padded(gpu_max_elements * gpu_vector_dim, 0.0f);
+      for (size_t i = 0; i < gpu_max_elements; ++i) {
+        std::memcpy(
+            padded.data() + i * gpu_vector_dim, vector_data_ + i * host_vector_dim, host_vector_dim * sizeof(float));
+      }
+      CUDA_CHECK(
+          cudaMemcpy(host_gpu_graph_state_.vector_data, padded.data(), gpu_vector_bytes, cudaMemcpyHostToDevice));
+    }
+
     const uint32_t gpu_size_links_level0 =
-        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (maxM0_ + BATCHSZ_PER_NEW) * 2, "size_links_level0");
+        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (maxM0_ + BATCHSZ_PER_NEW) * 2);
     const uint32_t gpu_size_links_per_element =
-        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (M_ + BATCHSZ_PER_NEW) * 2, "size_links_per_element");
-    const uint32_t gpu_data_size = checked_u32(data_size_, "data_size");
+        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (M_ + BATCHSZ_PER_NEW) * 2);
+
+    host_gpu_graph_state_.max_elements = gpu_max_elements;
+    host_gpu_graph_state_.cur_element_count = checked_u32(cur_element_count.load());
+    host_gpu_graph_state_.size_data_per_element = checked_u32(size_data_per_element_);
+    host_gpu_graph_state_.ef_construction = checked_u32(ef_construction_);
+    host_gpu_graph_state_.ef = checked_u32(ef_);
+    host_gpu_graph_state_.enterpoint_node =
+        cur_element_count.load() == 0 ? kInvalidGpuOffset : static_cast<uint32_t>(enterpoint_node_);
+    host_gpu_graph_state_.M = checked_u32(M_);
+    host_gpu_graph_state_.maxM0 = checked_u32(maxM0_);
+    host_gpu_graph_state_.size_links_level0 = gpu_size_links_level0;
+    host_gpu_graph_state_.size_links_per_element = gpu_size_links_per_element;
+    host_gpu_graph_state_.offsetData = checked_u32(offsetData_);
+    host_gpu_graph_state_.offsetLevel0 = checked_u32(offsetLevel0_);
+    host_gpu_graph_state_.label_offset = checked_u32(label_offset_);
+    host_gpu_graph_state_.data_size = checked_u32(data_size_);
+    host_gpu_graph_state_.maxlevel = maxlevel_;
+    host_gpu_graph_state_.mult = static_cast<float>(mult_);
+    host_gpu_graph_state_.revSize = static_cast<float>(revSize_);
+    host_gpu_graph_state_.vector_dim = gpu_vector_dim;
+
+    // GPU's own runtime states
+    const size_t gpu_level0_bytes = gpu_max_elements * gpu_size_links_level0;
+    gpuMalloc(&host_gpu_graph_state_.level0_links, gpu_level0_bytes);
+    gpuMemset(host_gpu_graph_state_.level0_links, 0, gpu_level0_bytes);
+    gpuMalloc(&host_gpu_graph_state_.level_counts, sizeof(uint32_t) * gpu_max_elements);
+    gpuMemset(host_gpu_graph_state_.level_counts, 0, sizeof(uint32_t) * gpu_max_elements);
+    gpuMalloc(&host_gpu_graph_state_.element_levels, sizeof(uint32_t) * gpu_max_elements);
+    gpuMalloc(&host_gpu_graph_state_.vector_powers, sizeof(float) * gpu_max_elements);
+    gpuMalloc(&host_gpu_graph_state_.half_vector_data, sizeof(half) * gpu_max_elements * gpu_vector_dim);
+    gpuMalloc(&host_gpu_graph_state_.old_vector_fetch_index, sizeof(uint32_t) * LEVEL_SZ_THRES);
+    gpuMalloc(&host_gpu_graph_state_.old_vector_store, sizeof(half) * LEVEL_SZ_THRES * gpu_vector_dim);
+    gpuMalloc(&host_gpu_graph_state_.link_lists, sizeof(char *) * gpu_max_elements);
+    gpuMemset(host_gpu_graph_state_.link_lists, 0, sizeof(char *) * gpu_max_elements);
+    gpuMalloc(&host_gpu_graph_state_.visited, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
+    gpuMemset(host_gpu_graph_state_.visited, 0, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
+    gpuMalloc(&host_gpu_graph_state_.frozen_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
+    gpuMemset(host_gpu_graph_state_.frozen_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
+    gpuMalloc(
+        &host_gpu_graph_state_.changed_old_links,
+        sizeof(uint32_t) * static_cast<size_t>(BATCHSZ_PER_NEW) * MAX_HNSW_LEVEL * static_cast<size_t>(maxM0_));
+    gpuMalloc(&host_gpu_graph_state_.changed_old_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL);
+    gpuMemset(host_gpu_graph_state_.changed_old_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL);
+
     const size_t old_new_distances_count = (BATCHSZ_PER_NEW) * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
+    gpuMalloc(&host_gpu_graph_state_.news_dist, sizeof(float) * old_new_distances_count);
+    gpuMalloc(&host_gpu_graph_state_.news_rank, sizeof(uint32_t) * old_new_distances_count);
+
     const size_t num_new_new_batches = (gpu_max_elements + BATCHSZ_PER_NEW - 1) / BATCHSZ_PER_NEW;
     const size_t precomputed_new_new_count = num_new_new_batches * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
-    const size_t gpu_vector_bytes =
-        static_cast<size_t>(gpu_max_elements) * static_cast<size_t>(gpu_vector_dim) * sizeof(float);
-    const size_t gpu_level0_bytes = static_cast<size_t>(gpu_max_elements) * static_cast<size_t>(gpu_size_links_level0);
-
-    try {
-      gpuMalloc(reinterpret_cast<void **>(&host_gpu_graph_state_.vector_data), gpu_vector_bytes);
-      if (host_vector_dim == gpu_vector_dim) {
-        CUDA_CHECK(
-            cudaMemcpy(host_gpu_graph_state_.vector_data, d_vector_data_, gpu_vector_bytes, cudaMemcpyHostToDevice));
-      } else {
-        // Pad each vector to gpu_vector_dim with zeros so WMMA K tiles never read past real data.
-        std::vector<float> padded_host(static_cast<size_t>(gpu_max_elements) * gpu_vector_dim, 0.0f);
-        for (uint32_t i = 0; i < gpu_max_elements; ++i) {
-          std::memcpy(
-              padded_host.data() + static_cast<size_t>(i) * gpu_vector_dim,
-              d_vector_data_ + static_cast<size_t>(i) * host_vector_dim,
-              static_cast<size_t>(host_vector_dim) * sizeof(float));
-        }
-        CUDA_CHECK(cudaMemcpy(
-            host_gpu_graph_state_.vector_data, padded_host.data(), gpu_vector_bytes, cudaMemcpyHostToDevice));
-      }
-
-      host_gpu_graph_state_.max_elements = gpu_max_elements;
-      host_gpu_graph_state_.cur_element_count = gpu_cur_count;
-      host_gpu_graph_state_.size_data_per_element = checked_u32(size_data_per_element_, "size_data_per_element");
-      host_gpu_graph_state_.ef_construction = checked_u32(ef_construction_, "ef_construction");
-      host_gpu_graph_state_.ef = checked_u32(ef_, "ef");
-      host_gpu_graph_state_.enterpoint_node =
-          cur_count == 0 ? kInvalidGpuOffset : static_cast<uint32_t>(enterpoint_node_);
-      host_gpu_graph_state_.M = checked_u32(M_, "M");
-      host_gpu_graph_state_.maxM0 = checked_u32(maxM0_, "maxM0");
-      host_gpu_graph_state_.size_links_level0 = gpu_size_links_level0;
-      host_gpu_graph_state_.size_links_per_element = gpu_size_links_per_element;
-      host_gpu_graph_state_.offsetData = checked_u32(offsetData_, "offsetData");
-      host_gpu_graph_state_.offsetLevel0 = checked_u32(offsetLevel0_, "offsetLevel0");
-      host_gpu_graph_state_.label_offset = checked_u32(label_offset_, "label_offset");
-      host_gpu_graph_state_.data_size = gpu_data_size;
-      host_gpu_graph_state_.maxlevel = maxlevel_;
-      host_gpu_graph_state_.mult = static_cast<float>(mult_);
-      host_gpu_graph_state_.revSize = static_cast<float>(revSize_);
-      // Padded dimension used as GPU vector stride (WMMA / half buffer layout).
-      host_gpu_graph_state_.vector_dim = gpu_vector_dim;
-
-      // GPU's own runtime states
-      gpuMalloc(&host_gpu_graph_state_.level0_links, gpu_level0_bytes);
-      gpuMemset(host_gpu_graph_state_.level0_links, 0, gpu_level0_bytes);
-      gpuMalloc(&host_gpu_graph_state_.level_counts, sizeof(uint32_t) * gpu_max_elements);
-      gpuMemset(host_gpu_graph_state_.level_counts, 0, sizeof(uint32_t) * gpu_max_elements);
-      gpuMalloc(&host_gpu_graph_state_.element_levels, sizeof(uint32_t) * gpu_max_elements);
-      gpuMalloc(&host_gpu_graph_state_.vector_powers, sizeof(float) * gpu_max_elements);
-      gpuMalloc(&host_gpu_graph_state_.half_vector_data, sizeof(half) * gpu_max_elements * gpu_vector_dim);
-      gpuMalloc(&host_gpu_graph_state_.old_vector_fetch_index, sizeof(uint32_t) * LEVEL_SZ_THRES);
-      gpuMalloc(&host_gpu_graph_state_.old_vector_store, sizeof(half) * LEVEL_SZ_THRES * gpu_vector_dim);
-      gpuMalloc(&host_gpu_graph_state_.link_lists, sizeof(char *) * gpu_max_elements);
-      gpuMemset(host_gpu_graph_state_.link_lists, 0, sizeof(char *) * gpu_max_elements);
-      gpuMalloc(&host_gpu_graph_state_.visited, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
-      gpuMemset(host_gpu_graph_state_.visited, 0, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
-      gpuMalloc(&host_gpu_graph_state_.frozen_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
-      gpuMemset(host_gpu_graph_state_.frozen_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
-      gpuMalloc(
-          &host_gpu_graph_state_.changed_old_links,
-          sizeof(uint32_t) * static_cast<size_t>(BATCHSZ_PER_NEW) * MAX_HNSW_LEVEL * static_cast<size_t>(maxM0_));
-      gpuMalloc(&host_gpu_graph_state_.changed_old_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL);
-      gpuMemset(host_gpu_graph_state_.changed_old_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL);
-
-      if (old_new_distances_count == 0) {
-        host_gpu_graph_state_.news_dist = nullptr;
-        host_gpu_graph_state_.news_rank = nullptr;
-      } else {
-        gpuMalloc(&host_gpu_graph_state_.news_dist, sizeof(float) * old_new_distances_count);
-        gpuMalloc(&host_gpu_graph_state_.news_rank, sizeof(uint32_t) * old_new_distances_count);
-      }
-
-      gpuMalloc(&host_gpu_graph_state_.precomputed_new_new_dist, sizeof(float) * precomputed_new_new_count);
-      gpuMalloc(&host_gpu_graph_state_.precomputed_new_new_rank, sizeof(uint32_t) * precomputed_new_new_count);
+    gpuMalloc(&host_gpu_graph_state_.precomputed_new_new_dist, sizeof(float) * precomputed_new_new_count);
+    gpuMalloc(&host_gpu_graph_state_.precomputed_new_new_rank, sizeof(uint32_t) * precomputed_new_new_count);
 
 #ifdef PROFILE_BUILD_PHASES
-      gpuMalloc(&host_gpu_graph_state_.build_phase_cycles, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount));
-      gpuMemset(host_gpu_graph_state_.build_phase_cycles, 0, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount));
-      host_gpu_graph_state_.profile_build_phases = profile_build_phases_;
-      host_gpu_graph_state_.build_batch_count = 0;
+    gpuMalloc(&host_gpu_graph_state_.build_phase_cycles, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount));
+    gpuMemset(host_gpu_graph_state_.build_phase_cycles, 0, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount));
+    host_gpu_graph_state_.profile_build_phases = profile_build_phases_;
+    host_gpu_graph_state_.build_batch_count = 0;
 #endif
 
-      // copy the graph state to GPU
-      gpuMalloc(&device_gpu_graph_state_, sizeof(GpuGraphState));
-      CUDA_CHECK(
-          cudaMemcpy(device_gpu_graph_state_, &host_gpu_graph_state_, sizeof(GpuGraphState), cudaMemcpyHostToDevice));
-      CUDA_CHECK(cudaGetLastError());
-
-      gpu_free_fn_ = &cuda_free_buffer;
-      gpu_graph_ready_ = true;
-    } catch (...) {
-      gpu_free_fn_ = &cuda_free_buffer;
-      release_gpu_state();
-      throw;
-    }
+    // copy the graph state to GPU
+    gpuMalloc(&device_gpu_graph_state_, sizeof(GpuGraphState));
+    CUDA_CHECK(
+        cudaMemcpy(device_gpu_graph_state_, &host_gpu_graph_state_, sizeof(GpuGraphState), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaGetLastError());
   }
 
   void copy_from_gpu() {
     printf("Copying graph state from GPU to CPU...\n");
-    if (!gpu_graph_ready_ || device_gpu_graph_state_ == nullptr) {
-      throw std::runtime_error("copy_from_gpu called before GPU graph state is ready");
-    }
 
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(
         cudaMemcpy(&host_gpu_graph_state_, device_gpu_graph_state_, sizeof(GpuGraphState), cudaMemcpyDeviceToHost));
 
     const size_t cur_count = host_gpu_graph_state_.cur_element_count;
-    if (cur_count > max_elements_) {
-      throw std::runtime_error("copy_from_gpu received an invalid cur_element_count");
-    }
-    const uint32_t host_vector_dim = checked_u32(data_size_ / sizeof(float), "vector_dim");
+    const uint32_t host_vector_dim = checked_u32(data_size_ / sizeof(float));
     const uint32_t expected_gpu_vector_dim = (host_vector_dim + 15u) / 16u * 16u;
     if (host_gpu_graph_state_.vector_dim != expected_gpu_vector_dim) {
-      throw std::runtime_error(
-          fmt::format(
-              "copy_from_gpu received incompatible vector dimension: gpu={} expected_padded={} host={}",
-              host_gpu_graph_state_.vector_dim,
-              expected_gpu_vector_dim,
-              host_vector_dim));
+      throw std::runtime_error(fmt::format("Incompatible vector dimension on GPU and CPU"));
     }
 
     cur_element_count = cur_count;
     maxlevel_ = host_gpu_graph_state_.maxlevel;
-    enterpoint_node_ = cur_count == 0 ? static_cast<tableint>(-1) : 0;
 
     std::vector<uint32_t> gpu_element_levels(max_elements_, 0);
     CUDA_CHECK(cudaMemcpy(
@@ -1160,12 +1106,10 @@ class HierarchicalNswLite {
         sizeof(uint32_t) * max_elements_,
         cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < max_elements_; ++i) {
-      if (gpu_element_levels[i] > static_cast<uint32_t>(MAX_HNSW_LEVEL)) {
-        throw std::runtime_error("copy_from_gpu received an invalid element level");
-      }
       element_levels_[i] = static_cast<int>(gpu_element_levels[i]);
     }
 
+    enterpoint_node_ = cur_count == 0 ? static_cast<tableint>(-1) : 0;
     for (size_t i = 0; i < cur_count; ++i) {
       if (element_levels_[i] == maxlevel_) {
         enterpoint_node_ = static_cast<tableint>(i);
@@ -1180,33 +1124,21 @@ class HierarchicalNswLite {
         sizeof(char *) * max_elements_,
         cudaMemcpyDeviceToHost));
 
-    if (host_gpu_graph_state_.level0_links == nullptr || host_gpu_graph_state_.vector_data == nullptr ||
-        host_gpu_graph_state_.link_lists == nullptr) {
-      throw std::runtime_error("copy_from_gpu received an incomplete GPU graph state");
-    }
-
-    auto copy_gpu_link_list = [&](void *cpu_link_list, const char *gpu_link_list, size_t cpu_capacity) {
-      if (gpu_link_list == nullptr) {
-        throw std::runtime_error("copy_from_gpu found a null GPU link list");
-      }
-
+    auto copy_gpu_linklist = [&](void *cpu_ll, const char *gpu_ll, size_t cpu_capacity) {
       uint32_t gpu_count = 0;
-      CUDA_CHECK(cudaMemcpy(&gpu_count, gpu_link_list, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-      if (gpu_count > cpu_capacity) {
-        throw std::runtime_error("copy_from_gpu received a GPU link count larger than the CPU list capacity");
-      }
+      CUDA_CHECK(cudaMemcpy(&gpu_count, gpu_ll, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-      memset(cpu_link_list, 0, sizeof(linklistsizeint) + sizeof(tableint) * cpu_capacity);
-      setListCount(static_cast<linklistsizeint *>(cpu_link_list), static_cast<unsigned short int>(gpu_count));
+      memset(cpu_ll, 0, sizeof(linklistsizeint) + sizeof(tableint) * cpu_capacity);
+      setListCount(static_cast<linklistsizeint *>(cpu_ll), static_cast<unsigned short int>(gpu_count));
       if (gpu_count == 0) {
         return;
       }
 
-      // GPU layout is: count, id capacity including batch scratch, then distances.
-      // CPU layout is only: count, ids. Copy the ids explicitly and skip GPU distances.
-      tableint *cpu_ids = reinterpret_cast<tableint *>(static_cast<linklistsizeint *>(cpu_link_list) + 1);
-      CUDA_CHECK(cudaMemcpy(
-          cpu_ids, gpu_link_list + sizeof(linklistsizeint), sizeof(tableint) * gpu_count, cudaMemcpyDeviceToHost));
+      // GPU layout is: count, id with capacity including batch scratch, then distances.
+      // CPU layout is: count, ids. Copy the ids explicitly and skip GPU distances.
+      tableint *cpu_ids = reinterpret_cast<tableint *>(static_cast<linklistsizeint *>(cpu_ll) + 1);
+      CUDA_CHECK(
+          cudaMemcpy(cpu_ids, gpu_ll + sizeof(linklistsizeint), sizeof(tableint) * gpu_count, cudaMemcpyDeviceToHost));
     };
 
     label_lookup_.clear();
@@ -1218,20 +1150,20 @@ class HierarchicalNswLite {
 
       memset(data_level0_memory_ + i * size_data_per_element_, 0, size_data_per_element_);
 
-      copy_gpu_link_list(
-          get_linklist0(static_cast<tableint>(i)),
+      copy_gpu_linklist(
+          get_linklist0(i),
           host_gpu_graph_state_.level0_links + i * static_cast<size_t>(host_gpu_graph_state_.size_links_level0),
           maxM0_);
 
       CUDA_CHECK(cudaMemcpy(
-          getDataByInternalId(static_cast<tableint>(i)),
+          getDataByInternalId(i),
           host_gpu_graph_state_.vector_data + i * host_gpu_graph_state_.vector_dim,
           data_size_,
           cudaMemcpyDeviceToHost));
 
-      const labeltype label = static_cast<labeltype>(i);
-      setExternalLabel(static_cast<tableint>(i), label);
-      label_lookup_[label] = static_cast<tableint>(i);
+      const labeltype label = i;
+      setExternalLabel(i, label);
+      label_lookup_[label] = i;
 
       const int level = element_levels_[i];
       if (level <= 0) {
@@ -1239,19 +1171,17 @@ class HierarchicalNswLite {
         continue;
       }
 
-      const size_t cpu_link_list_bytes = size_links_per_element_ * static_cast<size_t>(level);
+      const size_t cpu_link_list_bytes = size_links_per_element_ * level;
       linkLists_[i] = (char *)malloc(cpu_link_list_bytes);
-      if (linkLists_[i] == nullptr)
-        throw std::runtime_error("Not enough memory: copy_from_gpu failed to allocate linklist");
       memset(linkLists_[i], 0, cpu_link_list_bytes);
 
       for (int lv = 1; lv <= level; ++lv) {
         if (device_link_lists[i] == nullptr) {
           throw std::runtime_error("copy_from_gpu found a null GPU upper-layer link list");
         }
-        copy_gpu_link_list(
-            linkLists_[i] + static_cast<size_t>(lv - 1) * size_links_per_element_,
-            device_link_lists[i] + static_cast<size_t>(lv - 1) * host_gpu_graph_state_.size_links_per_element,
+        copy_gpu_linklist(
+            linkLists_[i] + (lv - 1) * size_links_per_element_,
+            device_link_lists[i] + (lv - 1) * host_gpu_graph_state_.size_links_per_element,
             maxM_);
       }
     }
