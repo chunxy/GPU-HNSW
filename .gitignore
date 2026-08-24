@@ -1,6 +1,7 @@
 .vscode/
 build/
 checkpoints/
+docs/
 logs/
 profilings/
 .breakpoints

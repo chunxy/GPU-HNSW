@@ -7,6 +7,6 @@
   ./build/Release/src/benchs/bench-index-search --datacard sift --k 10 --hardware CPU --M 8 --efc 50 --efs 100
 
   ./build/Release/src/benchs/bench-build-gpu --datacard siftsmall --k 10 --M 8 --efc 50 --profile
-  ./build/Release/src/benchs/bench-index-search --datacard siftsmall --k 10 --hardware GPU --M 8 --efc 50 --efs 100
-  ./build/Release/src/benchs/bench-index-search --datacard siftsmall --k 10 --hardware CPU --M 8 --efc 50 --efs 100
+  ./build/Release/src/benchs/bench-index-search --datacard siftsmall --k 10 --hardware GPU --M 8 --efc 50 --efs 10
+  ./build/Release/src/benchs/bench-index-search --datacard siftsmall --k 10 --hardware CPU --M 8 --efc 50 --efs 10
   ```
