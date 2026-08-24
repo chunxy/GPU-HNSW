@@ -1050,20 +1050,22 @@ __global__ void build_snapshot_frozen_kernel(GpuGraphState *state) {
   build_phase_record(state, kBuildPhaseSnapshotFrozen, phase_t0);
 }
 
-__global__ void build_search_prune_reverse_kernel(GpuGraphState *state) {
+__global__ void build_search_knn_lower_kernel(GpuGraphState *state) {
   const int startup_level = compute_startup_level(state);
   uint64_t phase_t0 = build_phase_begin(state);
-  // Search the KNN for the new vectors at lower levels (< startup_level).
-  // Store for new vectors all the intermediate results (up to TOPQ_SZ) for the next phase.
   search_knn_at_lower_kernel(state, startup_level);
   build_phase_record(state, kBuildPhaseSearchLower, phase_t0);
+}
 
-  phase_t0 = build_phase_begin(state);
-  // For the new vectors, combine and sort the old and new vectors by distance
+__global__ void build_finally_prune_new_kernel(GpuGraphState *state) {
+  uint64_t phase_t0 = build_phase_begin(state);
   finally_prune_for_new_kernel(state);
-  // Unfreeze reverse edges at lower levels (< startup_level) by adding reverse edges.
-  add_reverse_edges_for_new_at_lower_kernel(state, startup_level);
   build_phase_record(state, kBuildPhaseFinallyPruneNew, phase_t0);
+}
+
+__global__ void build_add_reverse_lower_kernel(GpuGraphState *state) {
+  const int startup_level = compute_startup_level(state);
+  add_reverse_edges_for_new_at_lower_kernel(state, startup_level);
 }
 
 __global__ void build_sort_prune_old_kernel(GpuGraphState *state) {
@@ -1106,7 +1108,9 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     build_dist_old_new_and_load_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_snapshot_frozen_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
-    build_search_prune_reverse_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_search_knn_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_finally_prune_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_add_reverse_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_sort_prune_old_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_update_batch_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
   }
