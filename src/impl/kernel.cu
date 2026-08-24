@@ -106,9 +106,9 @@ __device__ float *get_level_linklist_dist(GpuGraphState *state, uint32_t interna
   return level == 0 ? get_linklist_dist0(state, internal_id) : get_linklist_dist(state, internal_id, level);
 }
 
-__device__ unsigned short int getListCount(uint32_t *ptr) { return *((uint32_t *)ptr); }
+__device__ uint32_t getListCount(uint32_t *ptr) { return *((uint32_t *)ptr); }
 
-__device__ void setListCount(uint32_t *ptr, unsigned short int size) { *((tableint *)ptr) = size; }
+__device__ void setListCount(uint32_t *ptr, uint32_t size) { *((tableint *)ptr) = size; }
 
 __device__ uint32_t frozen_link_count_offset(GpuGraphState *state, uint32_t internal_id, int level) {
   return level * state->max_elements + internal_id;
