@@ -135,6 +135,7 @@ int main(int argc, char **argv) {
   hnswlib::L2Space space(c.vector_dim);
   hnswlib::HierarchicalNswLite<float> index(&space);
   index.loadIndex(index_path.string(), &space, c.n_base);
+  index.checkIntegrity();
   index.setEf(std::max(args.k, args.efs));
 
   size_t hit_count = 0;
