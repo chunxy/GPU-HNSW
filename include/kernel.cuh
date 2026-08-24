@@ -74,8 +74,6 @@ struct GpuGraphState {
 
 __global__ void prepare_graph_kernel(GpuGraphState *state);
 
-__global__ void build_graph_kernel(GpuGraphState *state);
-
 cudaError_t launch_prepare_graph_kernel(GpuGraphState *state);
 
 cudaError_t launch_precompute_new_new_dist_kernel(GpuGraphState *state, uint32_t max_elements);

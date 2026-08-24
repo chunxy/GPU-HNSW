@@ -1,37 +1,43 @@
-#include <cooperative_groups.h>
 #include <stdio.h>
 #include <type_traits>
 #include "hnswalg-lite.h"
 #include "kernel.cuh"
 
-namespace cg = cooperative_groups;
-
 namespace {
 
-__device__ uint64_t build_phase_begin(GpuGraphState *state, const cg::grid_group &grid) {
+__device__ uint64_t build_phase_begin(GpuGraphState *state) {
 #ifdef PROFILE_BUILD_PHASES
-  return (state->profile_build_phases && grid.thread_rank() == 0) ? clock64() : 0ULL;
+  return (state->profile_build_phases && blockIdx.x == 0 && threadIdx.x == 0) ? clock64() : 0ULL;
 #else
   (void)state;
-  (void)grid;
   return 0ULL;
 #endif
 }
 
-__device__ void build_phase_record(GpuGraphState *state, const cg::grid_group &grid, BuildPhase phase, uint64_t t0) {
+__device__ void build_phase_record(GpuGraphState *state, BuildPhase phase, uint64_t t0) {
 #ifdef PROFILE_BUILD_PHASES
-  if (state->profile_build_phases && grid.thread_rank() == 0) {
+  if (state->profile_build_phases && blockIdx.x == 0 && threadIdx.x == 0) {
     atomicAdd(reinterpret_cast<unsigned long long *>(state->build_phase_cycles + phase), clock64() - t0);
   }
 #else
   (void)state;
-  (void)grid;
   (void)phase;
   (void)t0;
 #endif
 }
 
-__device__ void build_grid_sync(const cg::grid_group &grid) { grid.sync(); }
+__device__ int compute_startup_level(GpuGraphState *state) {
+  int lo = -1, hi = state->maxlevel + 1;
+  while (hi - lo > 1) {
+    const int mid = (lo + hi) >> 1;
+    if (state->level_counts[mid] <= LEVEL_SZ_THRES) {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+  return min(hi, state->maxlevel);
+}
 
 constexpr unsigned long long kRandomLevelSeed = 0x9E3779B97F4A7C15ULL;
 constexpr uint32_t kChangedOldLinkFlag = 1U << 31;
@@ -361,18 +367,19 @@ __device__ void copy_float_to_half_kernel(GpuGraphState *state) {
   }
 }
 
-__device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv, const cg::grid_group &grid) {
+__device__ void reset_batch_state_kernel(GpuGraphState *state) {
+  if (blockIdx.x * blockDim.x + threadIdx.x == 0) {
+    state->old_vec_fetch_offset = 0;
+  }
+  for (int level = blockIdx.x * blockDim.x + threadIdx.x; level < MAX_HNSW_LEVEL; level += gridDim.x * blockDim.x) {
+    state->changed_old_link_counts[level] = 0;
+  }
+}
+
+__device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv) {
   __shared__ uint32_t block_local_ids[LEVEL_SZ_THRES];
   __shared__ uint32_t block_match_count;
   __shared__ uint32_t block_write_base;
-
-  if (grid.thread_rank() == 0) {
-    state->old_vec_fetch_offset = 0;
-  }
-  for (int level = grid.thread_rank(); level < MAX_HNSW_LEVEL; level += grid.size()) {
-    state->changed_old_link_counts[level] = 0;
-  }
-  grid.sync();
 
   if (threadIdx.x == 0) {
     block_match_count = 0;
@@ -993,139 +1000,111 @@ __device__ void snapshot_frozen_link_counts_kernel(GpuGraphState *state, int max
   }
 }
 
-// 1d grid, 1d block
-__global__ void build_graph_kernel(GpuGraphState *state) {
-  // build the graph with iterations: batch dependency
-  cg::grid_group grid = cg::this_grid();
-  for (int i = 0; i < state->max_elements; i += BATCHSZ_PER_NEW) {
-    int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
-    // Smallest L with level_counts[L] <= THRES (level_counts is non-increasing in L).
-    int lo = -1, hi = state->maxlevel + 1;
-    while (hi - lo > 1) {
-      const int mid = (lo + hi) >> 1;
-      if (state->level_counts[mid] <= LEVEL_SZ_THRES) {
-        hi = mid;
-      } else {
-        lo = mid;
-      }
-    }
-    const int startup_level = min(hi, state->maxlevel);
+__global__ void build_reset_batch_state_kernel(GpuGraphState *state) { reset_batch_state_kernel(state); }
 
-    uint64_t phase_t0 = build_phase_begin(state, grid);
-    // Aggregate the old vectors available on the startup level.
-    // Reset per-level changed_old_link_counts by the way.
-    aggregate_on_level_kernel(state, startup_level, grid);
-    build_phase_record(state, grid, kBuildPhaseAggregate, phase_t0);
-    build_grid_sync(grid);
+__global__ void build_aggregate_on_level_kernel(GpuGraphState *state) {
+  const int startup_level = compute_startup_level(state);
+  uint64_t phase_t0 = build_phase_begin(state);
+  // Aggregate the old vectors available on the startup level.
+  aggregate_on_level_kernel(state, startup_level);
+  build_phase_record(state, kBuildPhaseAggregate, phase_t0);
+}
 
-    phase_t0 = build_phase_begin(state, grid);
-    // Compute the distances between the new vectors and the old vectors.
-    compute_dist_with_old_kernel(state);
-    build_phase_record(state, grid, kBuildPhaseDistOldNew, phase_t0);
+__global__ void build_dist_old_new_and_load_new_new_kernel(GpuGraphState *state) {
+  uint64_t phase_t0 = build_phase_begin(state);
+  // Compute the distances between the new vectors and the old vectors.
+  compute_dist_with_old_kernel(state);
+  build_phase_record(state, kBuildPhaseDistOldNew, phase_t0);
 
-    phase_t0 = build_phase_begin(state, grid);
-    // Load the precomputed distances between the new vectors for this batch.
-    load_precomputed_new_new_dist(state);
-    build_phase_record(state, grid, kBuildPhaseLoadNewNew, phase_t0);
-    build_grid_sync(grid);
+  phase_t0 = build_phase_begin(state);
+  // Load the precomputed distances between the new vectors for this batch.
+  load_precomputed_new_new_dist(state);
+  build_phase_record(state, kBuildPhaseLoadNewNew, phase_t0);
+}
 
-    phase_t0 = build_phase_begin(state, grid);
-    // For the new vectors, sort the aggregated old vectors by distance
-    bitonic_sort_id_by_dis(state);
-    build_phase_record(state, grid, kBuildPhaseSortOldByDist, phase_t0);
+__global__ void build_sort_and_connect_upper_kernel(GpuGraphState *state) {
+  const int startup_level = compute_startup_level(state);
+  uint64_t phase_t0 = build_phase_begin(state);
+  // For the new vectors, sort the aggregated old vectors by distance
+  bitonic_sort_id_by_dis(state);
+  build_phase_record(state, kBuildPhaseSortOldByDist, phase_t0);
 
-    phase_t0 = build_phase_begin(state, grid);
-    // Connect the new vectors to the old vectors at upper levels (>= startup_level).
-    connect_new_to_old_at_upper_kernel(state, startup_level);
-    build_phase_record(state, grid, kBuildPhaseConnectUpper, phase_t0);
-    build_grid_sync(grid);
+  phase_t0 = build_phase_begin(state);
+  // Connect the new vectors to the old vectors at upper levels (>= startup_level).
+  connect_new_to_old_at_upper_kernel(state, startup_level);
+  build_phase_record(state, kBuildPhaseConnectUpper, phase_t0);
+}
 
-    // Connect the new vectors to the old vectors at lower levels (< startup_level).
+__global__ void build_snapshot_frozen_kernel(GpuGraphState *state) {
+  const int startup_level = compute_startup_level(state);
+  uint64_t phase_t0 = build_phase_begin(state);
+  // Freeze the link counts at lower levels (< startup_level)
+  // so that new vectors won't process the added reverse edges in current batch.
+  snapshot_frozen_link_counts_kernel(state, startup_level);
+  build_phase_record(state, kBuildPhaseSnapshotFrozen, phase_t0);
+}
 
-    phase_t0 = build_phase_begin(state, grid);
-    // Freeze the link counts at lower levels (< startup_level)
-    // so that new vectors won't process the added reverse edges in current batch.
-    snapshot_frozen_link_counts_kernel(state, startup_level);
-    build_phase_record(state, grid, kBuildPhaseSnapshotFrozen, phase_t0);
-    build_grid_sync(grid);
+__global__ void build_search_prune_reverse_kernel(GpuGraphState *state) {
+  const int startup_level = compute_startup_level(state);
+  uint64_t phase_t0 = build_phase_begin(state);
+  // Search the KNN for the new vectors at lower levels (< startup_level).
+  // Store for new vectors all the intermediate results (up to TOPQ_SZ) for the next phase.
+  search_knn_at_lower_kernel(state, startup_level);
+  build_phase_record(state, kBuildPhaseSearchLower, phase_t0);
 
-    phase_t0 = build_phase_begin(state, grid);
-    // Search the KNN for the new vectors at lower levels (< startup_level).
-    // Store for new vectors all the intermediate results (up to TOPQ_SZ) for the next phase.
-    search_knn_at_lower_kernel(state, startup_level);
-    build_phase_record(state, grid, kBuildPhaseSearchLower, phase_t0);
+  phase_t0 = build_phase_begin(state);
+  // For the new vectors, combine and sort the old and new vectors by distance
+  finally_prune_for_new_kernel(state);
+  // Unfreeze reverse edges at lower levels (< startup_level) by adding reverse edges.
+  add_reverse_edges_for_new_at_lower_kernel(state, startup_level);
+  build_phase_record(state, kBuildPhaseFinallyPruneNew, phase_t0);
+}
 
-    phase_t0 = build_phase_begin(state, grid);
-    // For the new vectors, combine and sort the old and new vectors by distance
-    finally_prune_for_new_kernel(state);
-    // Unfreeze reverse edges at lower levels (< startup_level) by adding reverse edges.
-    add_reverse_edges_for_new_at_lower_kernel(state, startup_level);
-    build_phase_record(state, grid, kBuildPhaseFinallyPruneNew, phase_t0);
-    // Wait for every block to finish those global mutations before any block
-    // starts sorting/pruning old-node adjacency, otherwise later phases can
-    // observe partially updated per-level lists.
-    build_grid_sync(grid);
+__global__ void build_sort_prune_old_kernel(GpuGraphState *state) {
+  uint64_t phase_t0 = build_phase_begin(state);
+  // Sort and prune only old-node lists that received reverse edges in this batch.
+  bitonic_sort_id_for_ll(state);
+  // Update frozen link counts for the levels that received reverse edges.
+  prune_neighbors_kernel(state);
+  build_phase_record(state, kBuildPhaseSortPruneOld, phase_t0);
+}
 
-    phase_t0 = build_phase_begin(state, grid);
-    // Sort and prune only old-node lists that received reverse edges in this batch.
-    bitonic_sort_id_for_ll(state);
-    // Update frozen link counts for the levels that received reverse edges.
-    prune_neighbors_kernel(state);
-    build_phase_record(state, grid, kBuildPhaseSortPruneOld, phase_t0);
-    build_grid_sync(grid);
-
-    phase_t0 = build_phase_begin(state, grid);
-    if (blockIdx.x == 0) {
-      update_level_counts_kernel(state);
-    }
-    if (grid.thread_rank() == 0) {
-      state->cur_element_count += new_count;
+__global__ void build_update_batch_kernel(GpuGraphState *state) {
+  uint64_t phase_t0 = build_phase_begin(state);
+  const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
+  if (blockIdx.x == 0) {
+    update_level_counts_kernel(state);
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    state->cur_element_count += new_count;
 #ifdef PROFILE_BUILD_PHASES
-      if (state->profile_build_phases) {
-        state->build_batch_count += 1ULL;
-      }
+    if (state->profile_build_phases) {
+      state->build_batch_count += 1ULL;
+    }
 #endif
 #ifndef NDEBUG
-      if (state->cur_element_count % 1024 == 0) {
-        printf("cur_element_count=%d\n", state->cur_element_count);
-      }
-#endif
+    if (state->cur_element_count % 1024 == 0) {
+      printf("cur_element_count=%d\n", state->cur_element_count);
     }
-    build_phase_record(state, grid, kBuildPhaseUpdateBatch, phase_t0);
-    build_grid_sync(grid);
+#endif
   }
+  build_phase_record(state, kBuildPhaseUpdateBatch, phase_t0);
 }
 
 cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
-  // TODO: consider multiple kernel launches
-  void *args[] = {&state};
-  dim3 gridDim(GRID_DIM);
-  dim3 blockDim(BLOCK_DIM);
-
-  int max_active_blocks = 0;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks, build_graph_kernel, BLOCK_DIM, 0);
-
-  int sm_count = 0;
-  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
-
-  const int occupancy_capacity = max_active_blocks * sm_count;
-  printf(
-      "build_graph_kernel cooperative launch: GRID_DIM=%d BLOCK_DIM=%d SMs=%d max_blocks/SM=%d capacity=%d\n",
-      GRID_DIM,
-      BLOCK_DIM,
-      sm_count,
-      max_active_blocks,
-      occupancy_capacity);
-  if (GRID_DIM > occupancy_capacity) {
-    printf(
-        "Fatal: GRID_DIM=%d exceeds cooperative capacity %d; grid.sync() would deadlock\n",
-        GRID_DIM,
-        occupancy_capacity);
-    return cudaErrorCooperativeLaunchTooLarge;
+  uint32_t max_elements = 0;
+  cudaMemcpy(&max_elements, &state->max_elements, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+  for (uint32_t i = 0; i < max_elements; i += BATCHSZ_PER_NEW) {
+    build_reset_batch_state_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_aggregate_on_level_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_dist_old_new_and_load_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_snapshot_frozen_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_search_prune_reverse_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_sort_prune_old_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_update_batch_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
   }
-  fflush(stdout);
-
-  return cudaLaunchCooperativeKernel((void *)build_graph_kernel, gridDim, blockDim, args);
+  return cudaGetLastError();
 }
 
 // 1d grid, 1d block
@@ -1589,9 +1568,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         topq_sz = 0;
         MaxPqPush(topq, &topq_sz, curr_dist, curr_obj, 1);
         topq_max = curr_dist;
-#ifndef NDEBUG
-        printf("Run to here: %s %d, Vector %d, Level %d\n", __FILE__, __LINE__, vid, lv);
-#endif
+// #ifndef NDEBUG
+//         printf("Run to here: %s %d, Vector %d, Level %d\n", __FILE__, __LINE__, vid, lv);
+// #endif
         ++visited_tag;
       }
       __syncthreads();
