@@ -7,7 +7,6 @@ profilings/
 .breakpoints
 .variables
 angle.cu
-compile.sh
 run.sh
 gt.sh
 test-ip-vs-mm.sh
