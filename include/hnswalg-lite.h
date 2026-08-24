@@ -1053,9 +1053,10 @@ class HierarchicalNswLite {
     gpuMemset(host_gpu_graph_state_.visited, 0, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
     gpuMalloc(&host_gpu_graph_state_.frozen_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
     gpuMemset(host_gpu_graph_state_.frozen_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
+    // There are at most BATCHSZ_PER_NEW * maxM0_ changed old links per level.
     gpuMalloc(
         &host_gpu_graph_state_.changed_old_links,
-        sizeof(uint32_t) * static_cast<size_t>(BATCHSZ_PER_NEW) * MAX_HNSW_LEVEL * static_cast<size_t>(maxM0_));
+        sizeof(uint32_t) * static_cast<size_t>(MAX_HNSW_LEVEL) * BATCHSZ_PER_NEW * maxM0_);
     gpuMalloc(&host_gpu_graph_state_.changed_old_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL);
     gpuMemset(host_gpu_graph_state_.changed_old_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL);
 
