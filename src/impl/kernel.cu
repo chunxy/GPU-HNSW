@@ -98,6 +98,14 @@ __device__ float *get_linklist_dist0(GpuGraphState *state, uint32_t internal_id)
                    (state->maxM0 + BATCHSZ_PER_NEW) * sizeof(uint32_t));
 }
 
+__device__ uint32_t *get_level_linklist(GpuGraphState *state, uint32_t internal_id, int level) {
+  return level == 0 ? get_linklist0(state, internal_id) : get_linklist(state, internal_id, level);
+}
+
+__device__ float *get_level_linklist_dist(GpuGraphState *state, uint32_t internal_id, int level) {
+  return level == 0 ? get_linklist_dist0(state, internal_id) : get_linklist_dist(state, internal_id, level);
+}
+
 __device__ unsigned short int getListCount(uint32_t *ptr) { return *((uint32_t *)ptr); }
 
 __device__ void setListCount(uint32_t *ptr, unsigned short int size) { *((tableint *)ptr) = size; }
@@ -279,9 +287,9 @@ __device__ void bitonic_sort_id_by_dis(GpuGraphState *state) {
 }
 
 __device__ void bitonic_sort(GpuGraphState *state, uint32_t vid, int lv) {
-  uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+  uint32_t *linkl = get_level_linklist(state, vid, lv);
   uint32_t *datal = (uint32_t *)(linkl + 1);
-  float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+  float *distl = get_level_linklist_dist(state, vid, lv);
   int len = getListCount(linkl);
   if (len <= 1) return;
 
@@ -318,7 +326,7 @@ __device__ void bitonic_sort_id_for_ll(GpuGraphState *state) {
 __device__ void bitonic_sort_id_for_all_ll(GpuGraphState *state) {
   for (int vid = blockIdx.x; vid < state->cur_element_count; vid += gridDim.x) {
     for (int lv = 0; lv <= state->element_levels[vid]; lv++) {
-      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+      uint32_t *linkl = get_level_linklist(state, vid, lv);
       const int len = getListCount(linkl);
       if (len <= 1 || len == get_frozen_link_count(state, vid, lv)) continue;
       bitonic_sort(state, vid, lv);
@@ -732,12 +740,11 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
       }
 
       // Still treat as 1d block, adding all the selected edges based on the result.
-      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+      uint32_t *linkl = get_level_linklist(state, vid, lv);
       uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+      float *distl = get_level_linklist_dist(state, vid, lv);
       for (int i = threadIdx.x; i < curr_neigh_cnt; i += blockDim.x) {
         const uint32_t cand = ranked_cand[neigh_rank[i]];
-        const uint32_t capacity = lv == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
 #ifndef NDEBUG
         if (state->element_levels[cand] < lv) {
           printf("Fatal: connect_new_to_old selected off-level candidate %u at level %d for new %u\n", cand, lv, vid);
@@ -746,6 +753,7 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 #endif
         int pos = atomicAdd((uint32_t *)linkl, 1);
 #ifndef NDEBUG
+        const uint32_t capacity = lv == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
         if (pos >= capacity) {
           printf("Fatal: new node link list out of bound at level %d for node %u\n", lv, vid);
           assert(false);
@@ -754,10 +762,9 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
         datal[pos] = cand;
         distl[pos] = ranked_dist[neigh_rank[i]];
         if (cand >= state->cur_element_count) continue;
-        uint32_t *other_linkl = lv == 0 ? get_linklist0(state, cand) : get_linklist(state, cand, lv);
+        uint32_t *other_linkl = get_level_linklist(state, cand, lv);
         auto other_datal = (uint32_t *)(other_linkl) + 1;
-        float *other_distl =
-            lv == 0 ? (float *)get_linklist_dist0(state, cand) : (float *)get_linklist_dist(state, cand, lv);
+        float *other_distl = get_level_linklist_dist(state, cand, lv);
         int other_pos = atomicAdd((uint32_t *)other_linkl, 1);
         record_changed_old_link(state, cand, lv);
 #ifndef NDEBUG
@@ -791,10 +798,10 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
 
     for (int lv = 0; lv <= state->element_levels[vid]; ++lv) {
       // combine old neighbors and new vectors
-      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+      uint32_t *linkl = get_level_linklist(state, vid, lv);
       uint32_t sz = getListCount(linkl);
       uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+      float *distl = get_level_linklist_dist(state, vid, lv);
       if (threadIdx.x == 0) {
         shared_sz = sz;
         curr_neigh_cnt = 0;
@@ -941,19 +948,18 @@ __device__ void add_reverse_edges_for_new_at_lower_kernel(GpuGraphState *state, 
     const int vid = state->cur_element_count + bid;
     const int max_lv = min(startup_level - 1, state->element_levels[vid]);
     for (int lv = 0; lv <= max_lv; ++lv) {
-      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+      uint32_t *linkl = get_level_linklist(state, vid, lv);
       const int sz = getListCount(linkl);
       uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+      float *distl = get_level_linklist_dist(state, vid, lv);
       for (int i = threadIdx.x; i < sz; i += blockDim.x) {
         const uint32_t other = datal[i];
         if (other >= state->cur_element_count) {
           continue;
         }
-        uint32_t *other_linkl = lv == 0 ? get_linklist0(state, other) : get_linklist(state, other, lv);
+        uint32_t *other_linkl = get_level_linklist(state, other, lv);
         uint32_t *other_datal = (uint32_t *)(other_linkl) + 1;
-        float *other_distl =
-            lv == 0 ? (float *)get_linklist_dist0(state, other) : (float *)get_linklist_dist(state, other, lv);
+        float *other_distl = get_level_linklist_dist(state, other, lv);
         const uint32_t pos = atomicAdd((uint32_t *)(other_linkl), 1);
         record_changed_old_link(state, other, lv);
 #ifndef NDEBUG
@@ -982,7 +988,7 @@ __device__ void snapshot_frozen_link_counts_kernel(GpuGraphState *state, int max
          node_id += blockDim.x * gridDim.x) {
       uint32_t count = 0;
       if (state->element_levels[node_id] >= lv) {
-        uint32_t *linkl = lv == 0 ? get_linklist0(state, node_id) : get_linklist(state, node_id, lv);
+        uint32_t *linkl = get_level_linklist(state, node_id, lv);
         count = getListCount(linkl);
 #ifndef NDEBUG
         uint32_t *datal = (uint32_t *)(linkl + 1);
@@ -1282,9 +1288,9 @@ __device__ void prune_neighbors_kernel(GpuGraphState *state) {
       const uint32_t vid = state->changed_old_links[base + idx];
       int M = lv ? state->M : state->maxM0;
 
-      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+      uint32_t *linkl = get_level_linklist(state, vid, lv);
       uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+      float *distl = get_level_linklist_dist(state, vid, lv);
       int sz = getListCount(linkl);
 
       if (sz > M) {
@@ -1374,9 +1380,9 @@ __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state) {
     for (int lv = 0; lv <= state->element_levels[vid]; ++lv) {
       int M = lv ? state->M : state->maxM0;
 
-      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+      uint32_t *linkl = get_level_linklist(state, vid, lv);
       uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+      float *distl = get_level_linklist_dist(state, vid, lv);
       int sz = getListCount(linkl);
       if (sz == get_frozen_link_count(state, vid, lv)) continue;
 
@@ -1511,7 +1517,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         __syncthreads();
 
         const int size = get_frozen_link_count(state, curr_obj_shared, lv);
-        uint32_t *linkl = size > 0 ? get_linklist(state, curr_obj_shared, lv) : nullptr;
+        uint32_t *linkl = size > 0 ? get_level_linklist(state, curr_obj_shared, lv) : nullptr;
         uint32_t *datal = size > 0 ? (uint32_t *)(linkl + 1) : nullptr;
 
         float local_best;
@@ -1594,9 +1600,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         if (tx == 0) {
           warp_staging_sz[ty] = 0;
         }
-        const int size = get_frozen_link_count(state, tmp.nodeid, lv);
-        uint32_t *linkl =
-            size > 0 ? (lv == 0 ? get_linklist0(state, tmp.nodeid) : get_linklist(state, tmp.nodeid, lv)) : nullptr;
+        const int size = get_frozen_link_count(state, node, lv);
+        uint32_t *linkl = size > 0 ? get_level_linklist(state, node, lv) : nullptr;
         uint32_t *datal = size > 0 ? (uint32_t *)(linkl + 1) : nullptr;
         for (int i = ty; i < size; i += nrow) {  // compute the neighbors at the same time
           uint32_t cand = datal[i];
@@ -1640,9 +1645,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         __syncthreads();
       }
 
-      uint32_t *linkl = lv == 0 ? get_linklist0(state, vid) : get_linklist(state, vid, lv);
+      uint32_t *linkl = get_level_linklist(state, vid, lv);
       uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = lv == 0 ? (float *)get_linklist_dist0(state, vid) : (float *)get_linklist_dist(state, vid, lv);
+      float *distl = get_level_linklist_dist(state, vid, lv);
       const int write_sz = min(topq_sz, TOPQ_SZ);
       for (int i = threadIdx.x; i < write_sz; i += blockDim.x) {
         datal[i] = topq[i].nodeid;
