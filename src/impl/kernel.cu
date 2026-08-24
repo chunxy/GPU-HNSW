@@ -1106,11 +1106,28 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
 
   int max_active_blocks = 0;
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks, build_graph_kernel, BLOCK_DIM, 0);
-  printf("Max resident blocks per SM: %d\n", max_active_blocks);
+
+  int sm_count = 0;
+  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+
+  const int occupancy_capacity = max_active_blocks * sm_count;
+  printf(
+      "build_graph_kernel cooperative launch: GRID_DIM=%d BLOCK_DIM=%d SMs=%d max_blocks/SM=%d capacity=%d\n",
+      GRID_DIM,
+      BLOCK_DIM,
+      sm_count,
+      max_active_blocks,
+      occupancy_capacity);
+  if (GRID_DIM > occupancy_capacity) {
+    printf(
+        "Fatal: GRID_DIM=%d exceeds cooperative capacity %d; grid.sync() would deadlock\n",
+        GRID_DIM,
+        occupancy_capacity);
+    return cudaErrorCooperativeLaunchTooLarge;
+  }
   fflush(stdout);
 
-  cudaLaunchCooperativeKernel((void *)build_graph_kernel, gridDim, blockDim, args);
-  return cudaGetLastError();
+  return cudaLaunchCooperativeKernel((void *)build_graph_kernel, gridDim, blockDim, args);
 }
 
 // 1d grid, 1d block
