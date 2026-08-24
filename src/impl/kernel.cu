@@ -1481,6 +1481,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
   __shared__ int warp_staging_sz[SEARCH_WARP_COUNT];
   __shared__ float warp_best_dist[SEARCH_WARP_COUNT];
   __shared__ uint32_t warp_best_cand[SEARCH_WARP_COUNT];
+  __shared__ Neighbor popped;
+  __shared__ int search_continue;
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   if (threadIdx.x == 0) {
     visited = state->visited + blockIdx.x * state->max_elements;
@@ -1574,40 +1576,41 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         topq_sz = 0;
         MaxPqPush(topq, &topq_sz, curr_dist, curr_obj, 1);
         topq_max = curr_dist;
-// #ifndef NDEBUG
-//         printf("Run to here: %s %d, Vector %d, Level %d\n", __FILE__, __LINE__, vid, lv);
-// #endif
         ++visited_tag;
       }
       __syncthreads();
 
-      // Better not to do the beam search
-      while (candq_sz > 0) {
-        if (topq_sz >= state->ef_construction && candq[0].distance > topq_max) {
+      while (true) {
+        if (threadIdx.x == 0) {
+          search_continue =
+              (candq_sz > 0) && !(topq_sz >= static_cast<int>(state->ef_construction) && candq[0].distance > topq_max);
+          if (search_continue) {
+            popped = candq[0];
+            visited[popped.nodeid] = visited_tag;
+            MinPqPop(candq, &candq_sz, &popped);
+          }
+        }
+        __syncthreads();
+        if (!search_continue) {
           break;
         }
 
         const int tx = threadIdx.x % warpSize;
         const int ty = threadIdx.x / warpSize;
         const int nrow = blockDim.x / warpSize;
+        const uint32_t node = popped.nodeid;
 
-        Neighbor tmp{candq[0].distance, candq[0].nodeid, candq[0].checked};
-        if (threadIdx.x == 0) {
-          visited[tmp.nodeid] = visited_tag;
-          MinPqPop(candq, &candq_sz, &tmp);
-        }
-        __syncthreads();
         if (tx == 0) {
           warp_staging_sz[ty] = 0;
         }
         const int size = get_frozen_link_count(state, node, lv);
         uint32_t *linkl = size > 0 ? get_level_linklist(state, node, lv) : nullptr;
         uint32_t *datal = size > 0 ? (uint32_t *)(linkl + 1) : nullptr;
-        for (int i = ty; i < size; i += nrow) {  // compute the neighbors at the same time
+        for (int i = ty; i < size; i += nrow) {
           uint32_t cand = datal[i];
 #ifndef NDEBUG
           if (state->element_levels[cand] < lv) {
-            printf("Fatal: found off-level candidate %u at level %d from node %u\n", cand, lv, tmp.nodeid);
+            printf("Fatal: found off-level candidate %u at level %d from node %u\n", cand, lv, node);
             assert(false);
           }
 #endif
