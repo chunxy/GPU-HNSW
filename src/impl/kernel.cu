@@ -112,8 +112,6 @@ __device__ uint32_t changed_old_link_level_offset(GpuGraphState *state, int leve
   return level * BATCHSZ_PER_NEW * state->maxM0;
 }
 
-__device__ uint32_t changed_old_link_level_capacity(GpuGraphState *state) { return BATCHSZ_PER_NEW * state->maxM0; }
-
 __device__ void record_changed_old_link(GpuGraphState *state, uint32_t internal_id, int level) {
   if (internal_id >= state->cur_element_count || level < 0 || level >= MAX_HNSW_LEVEL) return;
 
@@ -123,7 +121,7 @@ __device__ void record_changed_old_link(GpuGraphState *state, uint32_t internal_
 
   const uint32_t offset = atomicAdd(&state->changed_old_link_counts[level], 1U);
 #ifndef NDEBUG
-  if (offset >= changed_old_link_level_capacity(state)) {
+  if (offset >= BATCHSZ_PER_NEW * state->maxM0) {
     printf("Fatal: changed_old_links out of bound at level %d\n", level);
     assert(false);
   }
