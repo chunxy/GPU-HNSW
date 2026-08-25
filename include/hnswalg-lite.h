@@ -995,9 +995,12 @@ class HierarchicalNswLite {
     const uint32_t host_vector_dim = checked_u32(data_size_ / sizeof(float));
     const uint32_t gpu_vector_dim = (host_vector_dim + 15u) / 16u * 16u;
     if (gpu_vector_dim > MAX_DIM) {
-      throw std::invalid_argument(fmt::format("vector dimension exceeds GPU maximum"));
+      throw std::invalid_argument(fmt::format("Vector dimension exceeds GPU maximum"));
     }
-    const size_t gpu_vector_bytes = gpu_max_elements * gpu_vector_dim * sizeof(float);
+    if (maxM0_ > MAX_M0) {
+      throw std::invalid_argument(fmt::format("maxM0 exceeds MAXM0"));
+    }
+    const size_t gpu_vector_bytes = static_cast<size_t>(gpu_max_elements) * gpu_vector_dim * sizeof(float);
     gpuMalloc(&host_gpu_graph_state_.vector_data, gpu_vector_bytes);
     if (host_vector_dim == gpu_vector_dim) {
       CUDA_CHECK(cudaMemcpy(host_gpu_graph_state_.vector_data, vector_data_, gpu_vector_bytes, cudaMemcpyHostToDevice));

@@ -651,7 +651,7 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
   __shared__ uint32_t curr_neigh_cnt;
-  __shared__ uint32_t neigh_rank[BATCHSZ_PER_NEW];
+  __shared__ uint32_t neigh_rank[MAX_M0];
   __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
   __shared__ bool can_continue;
   // connect new-to-old edges from startup level
@@ -804,7 +804,6 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
       float *distl = get_level_linklist_dist(state, vid, lv);
       if (threadIdx.x == 0) {
         shared_sz = sz;
-        curr_neigh_cnt = 0;
       }
       for (int i = threadIdx.x; i < sz; i += blockDim.x) {
         int other = datal[i];
@@ -813,7 +812,7 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
         ranked_cand[i] = other;
       }
       __syncthreads();
-      // static_assert(LEVEL_SZ_THRES - 32 >= BATCHSZ_PER_NEW);  // TODO: 32 is M, but for safety
+      static_assert(LEVEL_SZ_THRES - MAX_M0 >= BATCHSZ_PER_NEW);  // Avoid overwriting when moving data.
       for (int i = threadIdx.x; i < new_count; i += blockDim.x) {
         if (state->element_levels[state->cur_element_count + i] >= lv) {
           uint32_t pos = atomicAdd(&shared_sz, 1);
@@ -823,6 +822,16 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
       }
       __syncthreads();
       sz = shared_sz;
+
+      int M = lv ? state->M : state->maxM0;
+      // The branch that there is no need of pruning.
+      if (sz < M + 1) {  // +1 for self-edge.
+        for (int i = threadIdx.x; i < sz; i += blockDim.x) {
+          datal[i] = ranked_cand[i + 1];
+          distl[i] = ranked_dist[i + 1];
+        }
+        continue;
+      }
 
       // sort the combined neighbors by distance
       int sortlen = next_power_of_two(sz);
@@ -845,16 +854,14 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
 
       // prune all the candidates
       for (int i = threadIdx.x; i < sz; i += blockDim.x) {
-        if (ranked_cand[i] == vid || state->element_levels[ranked_cand[i]] < lv) {
-          pruned_mask[i] = 1;
-        } else {
-          pruned_mask[i] = 0;
-        }
+        pruned_mask[i] = 0;
       }
       __syncthreads();
 
       if (threadIdx.x == 0) {
-        for (int i = 0; i < sz; i++) {
+        pruned_mask[0] = 1;  // Avoid self-edge.
+        curr_neigh_cnt = 0;
+        for (int i = 1; i < sz; i++) {
           if (pruned_mask[i] == 0) {
             prev_neigh_rank = i;
             prev_neigh_id = ranked_cand[i];
@@ -873,7 +880,6 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
         __syncthreads();
         continue;
       }
-      int M = lv ? state->M : state->maxM0;
 
       while (curr_neigh_cnt < M) {
         // Start to treat the block as 2d, x for dimensions, y for candidates

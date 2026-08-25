@@ -19,6 +19,8 @@ const int MAX_DIM = 1024;
 
 const int MAX_HNSW_LEVEL = 32;
 
+const int MAX_M0 = 32;
+
 // Largest ef_construction supported by GPU build kernels (sizes shared-memory top-q buffers).
 const int MAX_EFC = 50;
 
