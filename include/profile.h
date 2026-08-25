@@ -10,7 +10,7 @@ enum BuildPhase : int {
   kBuildPhaseConnectUpper,
   kBuildPhaseSnapshotFrozen,
   kBuildPhaseSearchLower,
-  kBuildPhaseFinallyPruneNew,
+  kBuildPhaseCombinePruneNew,
   kBuildPhaseSortPruneOld,
   kBuildPhaseUpdateBatch,
   kBuildPhaseCount,
@@ -34,7 +34,7 @@ inline const char *build_phase_name(BuildPhase phase) {
       return "snapshot_frozen";
     case kBuildPhaseSearchLower:
       return "search_lower";
-    case kBuildPhaseFinallyPruneNew:
+    case kBuildPhaseCombinePruneNew:
       return "finally_prune_new";
     case kBuildPhaseSortPruneOld:
       return "sort_prune_old";

@@ -94,7 +94,7 @@ __device__ void connect_for_new_kernel(GpuGraphState *state, int startup_level);
 __device__ void prune_candidates_kernel(GpuGraphState *state, int lv);
 
 // For old vectors
-__device__ void prune_neighbors_kernel(GpuGraphState *state);
+__device__ void prune_for_old_kernel(GpuGraphState *state);
 
 __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state);
 

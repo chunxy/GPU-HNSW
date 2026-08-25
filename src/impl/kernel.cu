@@ -781,7 +781,7 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 }
 
 // 1 block for 1 new vector
-__device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
+__device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
   __shared__ uint32_t curr_neigh_cnt;
@@ -945,7 +945,7 @@ __device__ void finally_prune_for_new_kernel(GpuGraphState *state) {
 }
 
 // 1 block per new vector; reverse edges for levels below startup_level (deferred from search).
-__device__ void add_reverse_edges_for_new_at_lower_kernel(GpuGraphState *state, int startup_level) {
+__device__ void add_reverse_edges_at_lower_kernel(GpuGraphState *state, int startup_level) {
   if (startup_level <= 0) {
     return;
   }
@@ -1063,15 +1063,15 @@ __global__ void build_search_knn_lower_kernel(GpuGraphState *state) {
   build_phase_record(state, kBuildPhaseSearchLower, phase_t0);
 }
 
-__global__ void build_finally_prune_new_kernel(GpuGraphState *state) {
+__global__ void build_combine_prune_new_kernel(GpuGraphState *state) {
   uint64_t phase_t0 = build_phase_begin(state);
-  finally_prune_for_new_kernel(state);
-  build_phase_record(state, kBuildPhaseFinallyPruneNew, phase_t0);
+  combine_prune_for_new_kernel(state);
+  build_phase_record(state, kBuildPhaseCombinePruneNew, phase_t0);
 }
 
 __global__ void build_add_reverse_lower_kernel(GpuGraphState *state) {
   const int startup_level = compute_startup_level(state);
-  add_reverse_edges_for_new_at_lower_kernel(state, startup_level);
+  add_reverse_edges_at_lower_kernel(state, startup_level);
 }
 
 __global__ void build_sort_prune_old_kernel(GpuGraphState *state) {
@@ -1079,7 +1079,7 @@ __global__ void build_sort_prune_old_kernel(GpuGraphState *state) {
   // Sort and prune only old-node lists that received reverse edges in this batch.
   bitonic_sort_id_for_ll(state);
   // Update frozen link counts for the levels that received reverse edges.
-  prune_neighbors_kernel(state);
+  prune_for_old_kernel(state);
   build_phase_record(state, kBuildPhaseSortPruneOld, phase_t0);
 }
 
@@ -1115,7 +1115,7 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_snapshot_frozen_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_search_knn_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
-    build_finally_prune_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    build_combine_prune_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_add_reverse_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_sort_prune_old_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     build_update_batch_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
@@ -1284,7 +1284,7 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
 
 // 1 block for 1 old vector
 // assume that neighbor list has been sorted
-__device__ void prune_neighbors_kernel(GpuGraphState *state) {
+__device__ void prune_for_old_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
   __shared__ uint32_t curr_neigh_cnt;
