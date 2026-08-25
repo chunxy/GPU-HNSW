@@ -650,7 +650,7 @@ cudaError_t launch_precompute_new_new_dist_kernel(GpuGraphState *state, uint32_t
 __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int startup_lvl) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ uint32_t curr_neigh_cnt;
+  __shared__ volatile uint32_t curr_neigh_cnt;
   __shared__ uint32_t neigh_rank[MAX_M0];
   __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
   __shared__ bool can_continue;
@@ -784,7 +784,7 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 __device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ uint32_t curr_neigh_cnt;
+  __shared__ volatile uint32_t curr_neigh_cnt;
   __shared__ uint32_t neigh_rank[BATCHSZ_PER_NEW];
   __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
   __shared__ bool can_continue;
@@ -1287,7 +1287,7 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
 __device__ void prune_for_old_kernel(GpuGraphState *state) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
-  __shared__ uint32_t curr_neigh_cnt;
+  __shared__ volatile uint32_t curr_neigh_cnt;
   __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
   __shared__ bool can_continue;
 
