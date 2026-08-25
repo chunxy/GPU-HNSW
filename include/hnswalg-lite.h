@@ -1005,7 +1005,7 @@ class HierarchicalNswLite {
     if (host_vector_dim == gpu_vector_dim) {
       CUDA_CHECK(cudaMemcpy(host_gpu_graph_state_.vector_data, vector_data_, gpu_vector_bytes, cudaMemcpyHostToDevice));
     } else {
-      std::vector<float> padded(gpu_max_elements * gpu_vector_dim, 0.0f);
+      std::vector<float> padded(static_cast<size_t>(gpu_max_elements) * gpu_vector_dim, 0.0f);
       for (size_t i = 0; i < gpu_max_elements; ++i) {
         std::memcpy(
             padded.data() + i * gpu_vector_dim, vector_data_ + i * host_vector_dim, host_vector_dim * sizeof(float));
@@ -1040,7 +1040,7 @@ class HierarchicalNswLite {
     host_gpu_graph_state_.vector_dim = gpu_vector_dim;
 
     // GPU's own runtime states
-    const size_t gpu_level0_bytes = gpu_max_elements * gpu_size_links_level0;
+    const size_t gpu_level0_bytes = static_cast<size_t>(gpu_max_elements) * gpu_size_links_level0;
     gpuMalloc(&host_gpu_graph_state_.level0_links, gpu_level0_bytes);
     gpuMemset(host_gpu_graph_state_.level0_links, 0, gpu_level0_bytes);
     gpuMalloc(&host_gpu_graph_state_.level_counts, sizeof(uint32_t) * gpu_max_elements);
