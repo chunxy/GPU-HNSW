@@ -110,6 +110,10 @@ __device__ uint32_t getListCount(uint32_t *ptr) { return *((uint32_t *)ptr); }
 
 __device__ void setListCount(uint32_t *ptr, uint32_t size) { *((tableint *)ptr) = size; }
 
+__device__ uint32_t link_capacity_at_level(const GpuGraphState *state, int level) {
+  return level == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
+}
+
 __device__ uint32_t frozen_link_count_offset(GpuGraphState *state, uint32_t internal_id, int level) {
   return level * state->max_elements + internal_id;
 }
@@ -753,7 +757,7 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 #endif
         int pos = atomicAdd((uint32_t *)linkl, 1);
 #ifndef NDEBUG
-        const uint32_t capacity = lv == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
+        const uint32_t capacity = lv == link_capacity_at_level(state, lv);
         if (pos >= capacity) {
           printf("Fatal: new node link list out of bound at level %d for node %u\n", lv, vid);
           assert(false);
