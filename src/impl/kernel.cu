@@ -1437,8 +1437,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         __syncthreads();
 
         const int size = get_frozen_link_count(state, curr_obj_shared, lv);
-        uint32_t *linkl = size > 0 ? get_level_linklist(state, curr_obj_shared, lv) : nullptr;
-        uint32_t *datal = size > 0 ? (uint32_t *)(linkl + 1) : nullptr;
+        uint32_t *linkl = get_level_linklist(state, curr_obj_shared, lv);
+        uint32_t *datal = (uint32_t *)(linkl + 1);
 
         float local_best;
         uint32_t local_cand;
@@ -1522,8 +1522,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           warp_staging_sz[ty] = 0;
         }
         const int size = get_frozen_link_count(state, node, lv);
-        uint32_t *linkl = size > 0 ? get_level_linklist(state, node, lv) : nullptr;
-        uint32_t *datal = size > 0 ? (uint32_t *)(linkl + 1) : nullptr;
+        uint32_t *linkl = get_level_linklist(state, node, lv);
+        uint32_t *datal = (uint32_t *)(linkl + 1);
         for (int i = ty; i < size; i += nrow) {
           uint32_t cand = datal[i];
 #ifndef NDEBUG
