@@ -155,7 +155,7 @@ __device__ void record_changed_old_link(GpuGraphState *state, uint32_t internal_
 #define lt(x, y) (x < y)
 #define le(x, y) (x <= y)
 
-__device__ void MaxPqPop(Neighbor *pq, int *size) {
+__device__ void MaxPqPop(Neighbor *pq, volatile int *size) {
   if (*size == 0) return;
   (*size)--;
   float tail_dist = pq[*size].distance;
@@ -170,7 +170,7 @@ __device__ void MaxPqPop(Neighbor *pq, int *size) {
   pq[p] = pq[*size];
 }
 
-__device__ void MinPqPop(Neighbor *pq, int *size, Neighbor *tmp) {
+__device__ void MinPqPop(Neighbor *pq, volatile int *size, Neighbor *tmp) {
   if (*size == 0) return;
   (*size)--;
   tmp->distance = pq[0].distance;
@@ -188,7 +188,7 @@ __device__ void MinPqPop(Neighbor *pq, int *size, Neighbor *tmp) {
   pq[p] = pq[*size];
 }
 
-__device__ void MaxPqPush(Neighbor *pq, int *size, float dist, int nodeid, bool check) {
+__device__ void MaxPqPush(Neighbor *pq, volatile int *size, float dist, int nodeid, bool check) {
   int idx = *size;
   while (idx > 0) {
     int nidx = (idx + 1) / 2 - 1;
@@ -202,7 +202,7 @@ __device__ void MaxPqPush(Neighbor *pq, int *size, float dist, int nodeid, bool 
   (*size)++;
 }
 
-__device__ void MinPqPush(Neighbor *pq, int *size, float dist, int nodeid, bool check) {
+__device__ void MinPqPush(Neighbor *pq, volatile int *size, float dist, int nodeid, bool check) {
   int idx = *size;
   while (idx > 0) {
     int nidx = (idx + 1) / 2 - 1;
@@ -232,9 +232,9 @@ __device__ void find_closest_in_queue(const Neighbor *topq, int topq_sz, uint32_
 
 __device__ void merge_staged_neighbors_into_queues(
     Neighbor *candq,
-    int *candq_sz,
+    volatile int *candq_sz,
     Neighbor *topq,
-    int *topq_sz,
+    volatile int *topq_sz,
     float *topq_max,
     Neighbor (*warp_staging)[WARP_STAGING_CAP],
     const int *warp_staging_sz,
@@ -1386,9 +1386,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
   __shared__ uint32_t *visited;
   __shared__ uint32_t visited_tag;
   __shared__ Neighbor candq[CANDQ_SZ];
-  __shared__ int candq_sz;
+  __shared__ volatile int candq_sz;
   __shared__ Neighbor topq[TOPQ_SZ];
-  __shared__ int topq_sz;
+  __shared__ volatile int topq_sz;
   __shared__ float topq_max;
   __shared__ int changed;
   __shared__ uint32_t curr_obj_shared;
