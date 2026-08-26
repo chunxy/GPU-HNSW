@@ -216,7 +216,7 @@ __device__ void MinPqPush(Neighbor *pq, int *size, float dist, int nodeid, bool 
   (*size)++;
 }
 
-__device__ void find_closest_in_topq(const Neighbor *topq, int topq_sz, uint32_t *out_id, float *out_dist) {
+__device__ void find_closest_in_queue(const Neighbor *topq, int topq_sz, uint32_t *out_id, float *out_dist) {
   if (topq_sz <= 0) {
     return;
   }
@@ -246,16 +246,14 @@ __device__ void merge_staged_neighbors_into_queues(
       if (*topq_sz < ef_construction || dist < *topq_max) {
         if (*candq_sz < CANDQ_SZ) {
           MinPqPush(candq, candq_sz, dist, nodeid, false);
+        } else {
+          printf("Fatal: candq overflow %d > %d\n", *candq_sz, CANDQ_SZ);
         }
-        if (*topq_sz < TOPQ_SZ) {
-          MaxPqPush(topq, topq_sz, dist, nodeid, true);
-        }
-        while (*topq_sz > ef_construction) {
+        while (*topq_sz >= ef_construction) {
           MaxPqPop(topq, topq_sz);
         }
-        if (*topq_sz >= ef_construction) {
+        MaxPqPush(topq, topq_sz, dist, nodeid, true);
           *topq_max = topq[0].distance;
-        }
       }
     }
   }
@@ -1577,7 +1575,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
       if (threadIdx.x == 0) {
         setListCount(linkl, write_sz);
         float entry_dist = 0.0f;
-        find_closest_in_topq(topq, write_sz, &curr_obj_shared, &entry_dist);
+        find_closest_in_queue(candq, candq_sz, &curr_obj_shared, &entry_dist);
         curr_dist_bits_shared = __float_as_int(entry_dist);
 #ifndef NDEBUG
         const uint32_t capacity = lv == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
