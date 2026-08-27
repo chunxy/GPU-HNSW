@@ -325,37 +325,6 @@ __device__ void bitonic_sort_id_for_ll(GpuGraphState *state) {
   }
 }
 
-__device__ void bitonic_sort_id_for_all_ll(GpuGraphState *state) {
-  for (int vid = blockIdx.x; vid < state->cur_element_count; vid += gridDim.x) {
-    for (int lv = 0; lv <= state->element_levels[vid]; lv++) {
-      uint32_t *linkl = get_level_linklist(state, vid, lv);
-      const int len = getListCount(linkl);
-      if (len <= 1 || len == get_frozen_link_count(state, vid, lv)) continue;
-      bitonic_sort(state, vid, lv);
-    }
-  }
-}
-
-__device__ void bitonic_sort_pq(Neighbor *pq, unsigned len, bool inc = 1) {
-  if (len <= 1) return;
-  const unsigned tid = threadIdx.y * blockDim.x + threadIdx.x;
-  const unsigned sort_len = next_power_of_two(len);
-  for (unsigned stride = 1; stride < sort_len; stride <<= 1) {
-    for (unsigned step = stride; step > 0; step >>= 1) {
-      for (unsigned k = tid; k < sort_len / 2; k += blockDim.x * blockDim.y) {
-        unsigned a = 2 * step * (k / step);
-        unsigned b = k % step;
-        unsigned u = ((step == stride) ? (a + step - 1 - b) : (a + b));
-        unsigned d = a + b + step;
-        if (d < len && (inc ? pq[u].distance > pq[d].distance : pq[u].distance < pq[d].distance)) {
-          swap(pq[u], pq[d]);
-        }
-      }
-      __syncthreads();
-    }
-  }
-}
-
 __global__ void prepare_graph_kernel(GpuGraphState *state) {
   // compute the power of all the base vectors
   compute_power_kernel(state);
