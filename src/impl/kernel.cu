@@ -45,9 +45,8 @@ constexpr uint32_t kLinkCountMask = ~kChangedOldLinkFlag;
 }  // namespace
 
 struct Neighbor {
-  float distance;
-  int nodeid;
-  bool checked;
+  volatile float distance;
+  volatile int nodeid;
 };
 
 template <typename T>
@@ -201,7 +200,6 @@ __device__ void MaxPqPush(Neighbor *pq, volatile int *size, float dist, int node
   }
   pq[idx].distance = dist;
   pq[idx].nodeid = nodeid;
-  pq[idx].checked = check;
   (*size)++;
 }
 
@@ -215,7 +213,6 @@ __device__ void MinPqPush(Neighbor *pq, volatile int *size, float dist, int node
   }
   pq[idx].distance = dist;
   pq[idx].nodeid = nodeid;
-  pq[idx].checked = check;
   (*size)++;
 }
 
@@ -1523,7 +1520,6 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
             if (pos < WARP_STAGING_CAP) {
               warp_staging[ty][pos].distance = dist;
               warp_staging[ty][pos].nodeid = cand;
-              warp_staging[ty][pos].checked = false;
               warp_staging_sz[ty] = pos + 1;
             }
           }
