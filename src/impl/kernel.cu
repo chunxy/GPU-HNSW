@@ -155,6 +155,11 @@ __device__ void record_changed_old_link(GpuGraphState *state, uint32_t internal_
 #define lt(x, y) (x < y)
 #define le(x, y) (x <= y)
 
+__device__ void copy_neighbor(Neighbor *dst, const Neighbor *src) {
+  dst->distance = src->distance;
+  dst->nodeid = src->nodeid;
+}
+
 __device__ void MaxPqPop(Neighbor *pq, volatile int *size) {
   if (*size == 0) return;
   (*size)--;
@@ -163,29 +168,27 @@ __device__ void MaxPqPop(Neighbor *pq, volatile int *size) {
   while (r < *size) {
     if (r < (*size) - 1 && gt(pq[r + 1].distance, pq[r].distance)) r++;
     if (ge(tail_dist, pq[r].distance)) break;
-    pq[p] = pq[r];
+    copy_neighbor(&pq[p], &pq[r]);
     p = r;
     r = 2 * p + 1;
   }
-  pq[p] = pq[*size];
+  copy_neighbor(&pq[p], &pq[*size]);
 }
 
 __device__ void MinPqPop(Neighbor *pq, volatile int *size, Neighbor *tmp) {
   if (*size == 0) return;
   (*size)--;
-  tmp->distance = pq[0].distance;
-  tmp->nodeid = pq[0].nodeid;
-  tmp->checked = pq[0].checked;
+  copy_neighbor(tmp, &pq[0]);
   float tail_dist = pq[*size].distance;
   int p = 0, r = 1;
   while (r < *size) {
     if (r < (*size) - 1 && lt(pq[r + 1].distance, pq[r].distance)) r++;
     if (le(tail_dist, pq[r].distance)) break;
-    pq[p] = pq[r];
+    copy_neighbor(&pq[p], &pq[r]);
     p = r;
     r = 2 * p + 1;
   }
-  pq[p] = pq[*size];
+  copy_neighbor(&pq[p], &pq[*size]);
 }
 
 __device__ void MaxPqPush(Neighbor *pq, volatile int *size, float dist, int nodeid, bool check) {
@@ -193,7 +196,7 @@ __device__ void MaxPqPush(Neighbor *pq, volatile int *size, float dist, int node
   while (idx > 0) {
     int nidx = (idx + 1) / 2 - 1;
     if (ge(pq[nidx].distance, dist)) break;
-    pq[idx] = pq[nidx];
+    copy_neighbor(&pq[idx], &pq[nidx]);
     idx = nidx;
   }
   pq[idx].distance = dist;
@@ -207,7 +210,7 @@ __device__ void MinPqPush(Neighbor *pq, volatile int *size, float dist, int node
   while (idx > 0) {
     int nidx = (idx + 1) / 2 - 1;
     if (le(pq[nidx].distance, dist)) break;
-    pq[idx] = pq[nidx];
+    copy_neighbor(&pq[idx], &pq[nidx]);
     idx = nidx;
   }
   pq[idx].distance = dist;
