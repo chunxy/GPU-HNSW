@@ -102,4 +102,3 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lev
 
 __device__ void snapshot_frozen_link_counts_kernel(GpuGraphState *state, int max_level);
 
-__device__ void bitonic_sort_id_by_dis(float *shared_arr, unsigned *ids, unsigned len);
