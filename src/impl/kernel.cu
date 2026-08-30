@@ -175,7 +175,10 @@ __device__ void MaxPqPop(Neighbor *pq, volatile int *size) {
 }
 
 __device__ void MinPqPop(Neighbor *pq, volatile int *size, Neighbor *tmp) {
-  if (*size == 0) return;
+  if (*size == 0) {
+    printf("Fatal: MinPqPop: queue size == 0\n");
+    assert(false);
+  }
   (*size)--;
   copy_neighbor(tmp, &pq[0]);
   float tail_dist = pq[*size].distance;
@@ -216,18 +219,20 @@ __device__ void MinPqPush(Neighbor *pq, volatile int *size, float dist, int node
   (*size)++;
 }
 
-__device__ void find_closest_in_queue(const Neighbor *topq, int topq_sz, uint32_t *out_id, float *out_dist) {
-  if (topq_sz <= 0) {
+__device__ void find_closest_in_queue(const Neighbor *queue, int sz, uint32_t *out_id, float *out_dist) {
+  if (sz <= 0) {
+    printf("Fatal: queue size <= 0\n");
+    assert(false);
     return;
   }
   int best = 0;
-  for (int i = 1; i < topq_sz; ++i) {
-    if (topq[i].distance < topq[best].distance) {
+  for (int i = 1; i < sz; ++i) {
+    if (queue[i].distance < queue[best].distance) {
       best = i;
     }
   }
-  *out_id = topq[best].nodeid;
-  *out_dist = topq[best].distance;
+  *out_id = queue[best].nodeid;
+  *out_dist = queue[best].distance;
 }
 
 __device__ void merge_staged_neighbors_into_queues(
@@ -247,13 +252,15 @@ __device__ void merge_staged_neighbors_into_queues(
         if (*candq_sz < CANDQ_SZ) {
           MinPqPush(candq, candq_sz, dist, nodeid, false);
         } else {
+#ifndef NDEBUG
           printf("Fatal: candq overflow %d > %d\n", *candq_sz, CANDQ_SZ);
+#endif
         }
         while (*topq_sz >= ef_construction) {
           MaxPqPop(topq, topq_sz);
         }
         MaxPqPush(topq, topq_sz, dist, nodeid, true);
-          *topq_max = topq[0].distance;
+        *topq_max = topq[0].distance;
       }
     }
   }
@@ -617,6 +624,25 @@ cudaError_t launch_precompute_new_new_dist_kernel(GpuGraphState *state, uint32_t
   return cudaGetLastError();
 }
 
+#ifndef NDEBUG
+constexpr int kPrunedMaskCap = LEVEL_SZ_THRES + BATCHSZ_PER_NEW;
+
+__device__ inline void debug_check_pruned_mask_range(uint32_t n, const char *where, int vid, int lv) {
+  if (n > static_cast<uint32_t>(kPrunedMaskCap)) {
+    printf(
+        "Fatal: pruned_mask OOB at %s n=%u cap=%d vid=%d lv=%d block=%u tid=%u\n",
+        where,
+        n,
+        kPrunedMaskCap,
+        vid,
+        lv,
+        blockIdx.x,
+        threadIdx.x);
+    assert(false);
+  }
+}
+#endif
+
 // 1 block for 1 new vector
 __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int startup_lvl) {
   __shared__ uint32_t prev_neigh_rank;
@@ -634,6 +660,9 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 
     // prune candidates
     for (int lv = startup_lvl; lv <= state->element_levels[vid]; ++lv) {
+#ifndef NDEBUG
+      debug_check_pruned_mask_range(state->old_vec_fetch_offset, "connect_new_to_old", vid, lv);
+#endif
       for (int i = threadIdx.x; i < state->old_vec_fetch_offset; i += blockDim.x) {
         if (state->element_levels[ranked_cand[i]] < lv) {
           pruned_mask[i] = 1;
@@ -724,9 +753,14 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 #endif
         int pos = atomicAdd((uint32_t *)linkl, 1);
 #ifndef NDEBUG
-        const uint32_t capacity = lv == link_capacity_at_level(state, lv);
+        const uint32_t capacity = link_capacity_at_level(state, lv);
         if (pos >= capacity) {
-          printf("Fatal: new node link list out of bound at level %d for node %u\n", lv, vid);
+          printf(
+              "Fatal: new node link list out of bound at level %d for node %u: pos=%u, capacity=%u\n",
+              lv,
+              vid,
+              pos,
+              capacity);
           assert(false);
         }
 #endif
@@ -824,6 +858,9 @@ __device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
       }
 
       // prune all the candidates
+#ifndef NDEBUG
+      debug_check_pruned_mask_range(sz, "combine_prune_for_new", vid, lv);
+#endif
       for (int i = threadIdx.x; i < sz; i += blockDim.x) {
         pruned_mask[i] = 0;
       }
@@ -923,27 +960,125 @@ __device__ void add_reverse_edges_at_lower_kernel(GpuGraphState *state, int star
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
-    const int max_lv = min(startup_level - 1, state->element_levels[vid]);
+#ifndef NDEBUG
+    if (vid < 0 || static_cast<uint32_t>(vid) >= state->max_elements) {
+      printf(
+          "Fatal: add_reverse: vid %d out of range (max_elements=%u cur=%u bid=%d)\n",
+          vid,
+          state->max_elements,
+          state->cur_element_count,
+          bid);
+      assert(false);
+      continue;
+    }
+#endif
+    const int max_lv = min(startup_level - 1, static_cast<int>(state->element_levels[vid]));
     for (int lv = 0; lv <= max_lv; ++lv) {
+#ifndef NDEBUG
+      const uint32_t capacity = link_capacity_at_level(state, lv);
+      if (lv > 0 && (state->link_lists == nullptr || state->link_lists[vid] == nullptr)) {
+        printf(
+            "Fatal: add_reverse: new %d null link_lists at level %d (element_level=%u)\n",
+            vid,
+            lv,
+            state->element_levels[vid]);
+        assert(false);
+        continue;
+      }
+#endif
       uint32_t *linkl = get_level_linklist(state, vid, lv);
-      const int sz = getListCount(linkl);
+#ifndef NDEBUG
+      if (linkl == nullptr) {
+        printf("Fatal: add_reverse: new %d null linkl at level %d\n", vid, lv);
+        assert(false);
+        continue;
+      }
+#endif
+      const uint32_t sz = getListCount(linkl);
       uint32_t *datal = (uint32_t *)(linkl + 1);
       float *distl = get_level_linklist_dist(state, vid, lv);
-      for (int i = threadIdx.x; i < sz; i += blockDim.x) {
+#ifndef NDEBUG
+      if (sz > capacity) {
+        printf("Fatal: add_reverse: new %d level %d count %u exceeds capacity %u\n", vid, lv, sz, capacity);
+        assert(false);
+        continue;
+      }
+#endif
+      for (uint32_t i = threadIdx.x; i < sz; i += blockDim.x) {
         const uint32_t other = datal[i];
+#ifndef NDEBUG
+        if (other >= state->max_elements) {
+          printf(
+              "Fatal: add_reverse: new %d level %d neighbor[%u]=%u >= max_elements %u\n",
+              vid,
+              lv,
+              i,
+              other,
+              state->max_elements);
+          assert(false);
+          continue;
+        }
+        if (other >= state->cur_element_count + static_cast<uint32_t>(new_count)) {
+          printf(
+              "Fatal: add_reverse: new %d level %d neighbor[%u]=%u outside current batch "
+              "(cur=%u new_count=%d)\n",
+              vid,
+              lv,
+              i,
+              other,
+              state->cur_element_count,
+              new_count);
+          assert(false);
+          continue;
+        }
+#endif
         if (other >= state->cur_element_count) {
           continue;
         }
+#ifndef NDEBUG
+        if (state->element_levels[other] < static_cast<uint32_t>(lv)) {
+          printf(
+              "Fatal: add_reverse: other %u not on level %d (element_level=%u) from new %d idx %u\n",
+              other,
+              lv,
+              state->element_levels[other],
+              vid,
+              i);
+          assert(false);
+          continue;
+        }
+        if (lv > 0 && (state->link_lists == nullptr || state->link_lists[other] == nullptr)) {
+          printf("Fatal: add_reverse: other %u null link_lists at level %d from new %d\n", other, lv, vid);
+          assert(false);
+          continue;
+        }
+#endif
         uint32_t *other_linkl = get_level_linklist(state, other, lv);
         uint32_t *other_datal = (uint32_t *)(other_linkl) + 1;
         float *other_distl = get_level_linklist_dist(state, other, lv);
+#ifndef NDEBUG
+        if (other_linkl == nullptr) {
+          printf("Fatal: add_reverse: other %u null other_linkl at level %d from new %d\n", other, lv, vid);
+          assert(false);
+          continue;
+        }
+#endif
         const uint32_t pos = atomicAdd((uint32_t *)(other_linkl), 1);
         record_changed_old_link(state, other, lv);
 #ifndef NDEBUG
-        const uint32_t capacity = lv == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
         if (pos >= capacity) {
-          printf("Fatal: reverse link list out of bound at level %d for node %u\n", lv, other);
+          printf(
+              "Fatal: reverse link list out of bound at level %d for node %u "
+              "(pos=%u capacity=%u new=%d sz=%u idx=%u)\n",
+              lv,
+              other,
+              pos,
+              capacity,
+              vid,
+              sz,
+              i);
           assert(false);
+          continue;
         }
 #endif
         other_datal[pos] = vid;
@@ -1079,19 +1214,37 @@ __global__ void build_update_batch_kernel(GpuGraphState *state) {
 cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
   uint32_t max_elements = 0;
   cudaMemcpy(&max_elements, &state->max_elements, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+  auto sync_kernel = [](const char *name, uint32_t batch) -> cudaError_t {
+    const cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      printf("CUDA error after %s (batch start %u): %s\n", name, batch, cudaGetErrorString(err));
+    }
+    return err;
+  };
   for (uint32_t i = 0; i < max_elements; i += BATCHSZ_PER_NEW) {
     build_reset_batch_state_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_reset_batch_state_kernel", i); err != cudaSuccess) return err;
     build_aggregate_on_level_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_aggregate_on_level_kernel", i); err != cudaSuccess) return err;
     build_dist_old_new_and_load_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_dist_old_new_and_load_new_new_kernel", i); err != cudaSuccess)
+      return err;
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_sort_and_connect_upper_kernel", i); err != cudaSuccess) return err;
     build_snapshot_frozen_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_snapshot_frozen_kernel", i); err != cudaSuccess) return err;
     build_search_knn_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_search_knn_lower_kernel", i); err != cudaSuccess) return err;
     build_combine_prune_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_combine_prune_new_kernel", i); err != cudaSuccess) return err;
     build_add_reverse_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_add_reverse_lower_kernel", i); err != cudaSuccess) return err;
     build_sort_prune_old_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_sort_prune_old_kernel", i); err != cudaSuccess) return err;
     build_update_batch_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_update_batch_kernel", i); err != cudaSuccess) return err;
   }
-  return cudaGetLastError();
+  return cudaSuccess;
 }
 
 // 1d grid, 1d block
@@ -1275,6 +1428,9 @@ __device__ void prune_for_old_kernel(GpuGraphState *state) {
       int sz = getListCount(linkl);
 
       if (sz > M) {
+#ifndef NDEBUG
+        debug_check_pruned_mask_range(static_cast<uint32_t>(sz), "prune_for_old", static_cast<int>(vid), lv);
+#endif
         if (threadIdx.x == 0) {
           prev_neigh_rank = 0;
           prev_neigh_id = datal[0];
@@ -1349,6 +1505,112 @@ __device__ void prune_for_old_kernel(GpuGraphState *state) {
   }
 }
 
+#ifndef NDEBUG
+// Illegal-access guards for search_knn_at_lower_kernel. Check node identity and
+// upper-layer pointer *before* get_level_linklist / vector_data / visited loads.
+__device__ void debug_search_lower_check_id(GpuGraphState *state, uint32_t id, int vid, int lv, const char *where) {
+  if (id >= state->max_elements) {
+    printf(
+        "Fatal: search_knn_at_lower: %s id %u >= max_elements %u "
+        "(vid=%d lv=%d cur=%u block=%u tid=%u)\n",
+        where,
+        id,
+        state->max_elements,
+        vid,
+        lv,
+        state->cur_element_count,
+        blockIdx.x,
+        threadIdx.x);
+    assert(false);
+  }
+}
+
+__device__ void
+debug_search_lower_check_node_level(GpuGraphState *state, uint32_t id, int lv, int vid, const char *where) {
+  debug_search_lower_check_id(state, id, vid, lv, where);
+  if (lv < 0 || lv >= MAX_HNSW_LEVEL) {
+    printf("Fatal: search_knn_at_lower: %s level %d out of range for node %u (vid=%d)\n", where, lv, id, vid);
+    assert(false);
+  }
+  if (state->element_levels[id] < static_cast<uint32_t>(lv)) {
+    printf(
+        "Fatal: search_knn_at_lower: %s node %u not on level %d (element_level=%u vid=%d tid=%u)\n",
+        where,
+        id,
+        lv,
+        state->element_levels[id],
+        vid,
+        threadIdx.x);
+    assert(false);
+  }
+  if (lv > 0 && (state->link_lists == nullptr || state->link_lists[id] == nullptr)) {
+    printf(
+        "Fatal: search_knn_at_lower: %s null link_lists for node %u at level %d "
+        "(element_level=%u vid=%d)\n",
+        where,
+        id,
+        lv,
+        state->element_levels[id],
+        vid);
+    assert(false);
+  }
+}
+
+__device__ void debug_search_lower_check_list(
+    GpuGraphState *state,
+    uint32_t id,
+    int lv,
+    uint32_t size,
+    uint32_t *linkl,
+    int vid,
+    const char *where) {
+  if (linkl == nullptr) {
+    printf("Fatal: search_knn_at_lower: %s null linkl for node %u at level %d (vid=%d)\n", where, id, lv, vid);
+    assert(false);
+  }
+  const uint32_t capacity = link_capacity_at_level(state, lv);
+  if (size > capacity) {
+    printf(
+        "Fatal: search_knn_at_lower: %s node %u level %d size %u exceeds capacity %u (vid=%d)\n",
+        where,
+        id,
+        lv,
+        size,
+        capacity,
+        vid);
+    assert(false);
+  }
+}
+
+__device__ void
+debug_search_lower_check_cand(GpuGraphState *state, uint32_t cand, uint32_t from, int lv, int vid, const char *where) {
+  if (cand >= state->max_elements) {
+    printf(
+        "Fatal: search_knn_at_lower: %s cand %u >= max_elements %u from node %u "
+        "at lv %d (vid=%d)\n",
+        where,
+        cand,
+        state->max_elements,
+        from,
+        lv,
+        vid);
+    assert(false);
+  }
+  if (state->element_levels[cand] < static_cast<uint32_t>(lv)) {
+    printf(
+        "Fatal: search_knn_at_lower: %s off-level cand %u (element_level=%u) at lv %d "
+        "from node %u (vid=%d)\n",
+        where,
+        cand,
+        state->element_levels[cand],
+        lv,
+        from,
+        vid);
+    assert(false);
+  }
+}
+#endif  // NDEBUG
+
 // 1 block for 1 new vector
 // threads for distance computation
 __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv) {
@@ -1367,8 +1629,28 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
   __shared__ float warp_best_dist[SEARCH_WARP_COUNT];
   __shared__ uint32_t warp_best_cand[SEARCH_WARP_COUNT];
   __shared__ Neighbor popped;
-  __shared__ int search_continue;
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
+#ifndef NDEBUG
+  if (threadIdx.x == 0) {
+    if (state->visited == nullptr) {
+      printf("Fatal: search_knn_at_lower: visited is null\n");
+      assert(false);
+    }
+    if (state->vector_data == nullptr) {
+      printf("Fatal: search_knn_at_lower: vector_data is null\n");
+      assert(false);
+    }
+    if (state->news_rank == nullptr || state->news_dist == nullptr) {
+      printf("Fatal: search_knn_at_lower: news_rank/news_dist is null\n");
+      assert(false);
+    }
+    if (blockIdx.x >= static_cast<uint32_t>(GRID_DIM)) {
+      printf("Fatal: search_knn_at_lower: blockIdx %u >= GRID_DIM %d\n", blockIdx.x, GRID_DIM);
+      assert(false);
+    }
+  }
+  __syncthreads();
+#endif
   if (threadIdx.x == 0) {
     visited = state->visited + blockIdx.x * state->max_elements;
     visited_tag = 0;
@@ -1380,6 +1662,17 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
   __syncthreads();
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
+#ifndef NDEBUG
+    if (vid < 0 || static_cast<uint32_t>(vid) >= state->max_elements) {
+      printf(
+          "Fatal: search_knn_at_lower: vid %d out of range (max_elements=%u cur=%u bid=%d)\n",
+          vid,
+          state->max_elements,
+          state->cur_element_count,
+          bid);
+      assert(false);
+    }
+#endif
     const int lvl = state->element_levels[vid];
     const int tx = threadIdx.x % warpSize;
     const int ty = threadIdx.x / warpSize;
@@ -1392,20 +1685,56 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
       auto dists = state->news_dist + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
       curr_obj_shared = ranks[0];
       curr_dist_bits_shared = __float_as_int(dists[0]);
+#ifndef NDEBUG
+      if (curr_obj_shared >= state->max_elements) {
+        printf(
+            "Fatal: search_knn_at_lower: entry ranks[0]=%u >= max_elements %u "
+            "(vid=%d bid=%d old_vec_fetch_offset=%u)\n",
+            curr_obj_shared,
+            state->max_elements,
+            vid,
+            bid,
+            state->old_vec_fetch_offset);
+        assert(false);
+      }
+      {
+        const int entry_lv = startup_lv - 1;
+        if (entry_lv > 0 && state->element_levels[curr_obj_shared] < static_cast<uint32_t>(entry_lv)) {
+          printf(
+              "Fatal: search_knn_at_lower: entry ranks[0]=%u not on level %d "
+              "(element_level=%u vid=%d)\n",
+              curr_obj_shared,
+              entry_lv,
+              state->element_levels[curr_obj_shared],
+              vid);
+          assert(false);
+        }
+      }
+#endif
     }
     __syncthreads();
 
     int lv = startup_lv - 1;
     while (lv > lvl) {
       while (1) {
-        if (threadIdx.x == 0) {
-          changed = 0;
+#ifndef NDEBUG
+        if (threadIdx.x == 0 && state->old_vec_fetch_offset == 0) {
+          printf(
+              "Fatal: search_knn_at_lower: old_vec_fetch_offset == 0\n"
+              "Startup level %d, vid %d, element level %d\n",
+              startup_lv,
+              vid,
+              lvl);
+          assert(false);
         }
-        __syncthreads();
-
+        debug_search_lower_check_node_level(state, curr_obj, lv, vid, "greedy expand");
+#endif
         const int size = get_frozen_link_count(state, curr_obj_shared, lv);
         uint32_t *linkl = get_level_linklist(state, curr_obj_shared, lv);
         uint32_t *datal = (uint32_t *)(linkl + 1);
+#ifndef NDEBUG
+        debug_search_lower_check_list(state, curr_obj, lv, static_cast<uint32_t>(size), linkl, vid, "greedy expand");
+#endif
 
         float local_best;
         uint32_t local_cand;
@@ -1415,6 +1744,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         }
         for (int i = ty; i < size; i += nrow) {
           uint32_t cand = datal[i];
+#ifndef NDEBUG
+          debug_search_lower_check_cand(state, cand, curr_obj, lv, vid, "greedy neighbor");
+#endif
           float dist = 0.0f;
           for (int j = tx; j < state->vector_dim; j += warpSize) {
             const float diff = state->vector_data[cand * state->vector_dim + j] - query_vec[j];
@@ -1454,9 +1786,10 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
     // Search and insert at current level.
     while (lv >= 0) {
       if (threadIdx.x == 0) {
+#ifndef NDEBUG
+        debug_search_lower_check_id(state, curr_obj, vid, lv, "beam entry");
+#endif
         candq_sz = 0;
-        float curr_dist = __int_as_float(curr_dist_bits_shared);
-        uint32_t curr_obj = curr_obj_shared;
         MinPqPush(candq, &candq_sz, curr_dist, curr_obj, 0);
         topq_sz = 0;
         MaxPqPush(topq, &topq_sz, curr_dist, curr_obj, 1);
@@ -1466,6 +1799,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
       __syncthreads();
 
       while (true) {
+#ifndef NDEBUG
+        debug_search_lower_check_node_level(state, node, lv, vid, "beam expand");
+#endif
         if (threadIdx.x == 0) {
           search_continue =
               (candq_sz > 0) && !(topq_sz >= static_cast<int>(state->ef_construction) && candq[0].distance > topq_max);
@@ -1491,13 +1827,13 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         const int size = get_frozen_link_count(state, node, lv);
         uint32_t *linkl = get_level_linklist(state, node, lv);
         uint32_t *datal = (uint32_t *)(linkl + 1);
+#ifndef NDEBUG
+        debug_search_lower_check_list(state, node, lv, size, linkl, vid, "beam expand");
+#endif
         for (int i = ty; i < size; i += nrow) {
           uint32_t cand = datal[i];
 #ifndef NDEBUG
-          if (state->element_levels[cand] < lv) {
-            printf("Fatal: found off-level candidate %u at level %d from node %u\n", cand, lv, node);
-            assert(false);
-          }
+          debug_search_lower_check_cand(state, cand, node, lv, vid, "beam neighbor");
 #endif
           uint32_t prev_tag = 0;
           if (tx == 0) {
@@ -1518,6 +1854,18 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           if (tx == 0) {
             const int pos = warp_staging_sz[ty];
             if (pos < WARP_STAGING_CAP) {
+#ifndef NDEBUG
+              if (cand >= state->max_elements) {
+                printf(
+                    "Fatal: search_knn_at_lower: cand %u out of range "
+                    "(vid=%d lv=%d max_elements=%u)\n",
+                    cand,
+                    vid,
+                    lv,
+                    state->max_elements);
+                assert(false);
+              }
+#endif
               warp_staging[ty][pos].distance = dist;
               warp_staging[ty][pos].nodeid = cand;
               warp_staging_sz[ty] = pos + 1;
@@ -1528,14 +1876,39 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         if (threadIdx.x == 0) {
           merge_staged_neighbors_into_queues(
               candq, &candq_sz, topq, &topq_sz, &topq_max, warp_staging, warp_staging_sz, state->ef_construction);
+#ifndef NDEBUG
+          if (candq_sz < 0 || candq_sz > CANDQ_SZ || topq_sz < 0 || topq_sz > TOPQ_SZ) {
+            printf(
+                "Fatal: search_knn_at_lower: queue overflow after merge "
+                "(vid=%d lv=%d candq_sz=%d/%d topq_sz=%d/%d)\n",
+                vid,
+                lv,
+                candq_sz,
+                CANDQ_SZ,
+                topq_sz,
+                TOPQ_SZ);
+            assert(false);
+          }
+#endif
         }
         __syncthreads();
       }
 
+#ifndef NDEBUG
+      debug_search_lower_check_node_level(state, static_cast<uint32_t>(vid), lv, vid, "writeback new");
+#endif
       uint32_t *linkl = get_level_linklist(state, vid, lv);
       uint32_t *datal = (uint32_t *)(linkl + 1);
       float *distl = get_level_linklist_dist(state, vid, lv);
       const int write_sz = min(topq_sz, TOPQ_SZ);
+#ifndef NDEBUG
+      debug_search_lower_check_list(
+          state, static_cast<uint32_t>(vid), lv, static_cast<uint32_t>(write_sz), linkl, vid, "writeback new");
+      if (distl == nullptr) {
+        printf("Fatal: search_knn_at_lower: writeback null distl for new %d at level %d\n", vid, lv);
+        assert(false);
+      }
+#endif
       for (int i = threadIdx.x; i < write_sz; i += blockDim.x) {
         datal[i] = topq[i].nodeid;
         distl[i] = topq[i].distance;
@@ -1546,9 +1919,15 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         find_closest_in_queue(candq, candq_sz, &curr_obj_shared, &entry_dist);
         curr_dist_bits_shared = __float_as_int(entry_dist);
 #ifndef NDEBUG
-        const uint32_t capacity = lv == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
-        if (write_sz > capacity) {
-          printf("Fatal: staged search results exceed link list capacity\n");
+        if (curr_obj >= state->max_elements) {
+          printf(
+              "Fatal: search_knn_at_lower: next-level entry %u >= max_elements %u "
+              "(vid=%d lv=%d topq_sz=%d)\n",
+              curr_obj,
+              state->max_elements,
+              vid,
+              lv,
+              topq_sz);
           assert(false);
         }
 #endif
