@@ -1633,7 +1633,7 @@ debug_search_lower_check_cand(GpuGraphState *state, uint32_t cand, uint32_t from
 
 // 1 block for 1 new vector
 // threads for distance computation
-__device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv) {
+__device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int startup_lv) {
   __shared__ uint32_t *visited;
   __shared__ uint32_t visited_tag;
   __shared__ Neighbor candq[CANDQ_SZ];
@@ -1641,7 +1641,6 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
   __shared__ Neighbor topq[TOPQ_SZ];
   __shared__ volatile int topq_sz;
   __shared__ float topq_max;
-  __shared__ int changed;
   __shared__ uint32_t curr_obj_shared;
   __shared__ int curr_dist_bits_shared;
   __shared__ Neighbor warp_staging[SEARCH_WARP_COUNT][WARP_STAGING_CAP];
@@ -1733,6 +1732,11 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
 #endif
     }
     __syncthreads();
+    // Per-thread copy of the current object. Avoid expanding through a shared
+    // `popped` / `curr_obj_shared` that other threads can keep from a previous
+    // bid (lv=0 node or uninitialized 0x01010101) after the handshake.
+    uint32_t curr_obj = curr_obj_shared;
+    float curr_dist = __int_as_float(curr_dist_bits_shared);
 
     int lv = startup_lv - 1;
     while (lv > lvl) {
@@ -1750,7 +1754,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         debug_search_lower_check_node_level(state, curr_obj, lv, vid, "greedy expand");
 #endif
         const int size = get_frozen_link_count(state, curr_obj_shared, lv);
-        uint32_t *linkl = get_level_linklist(state, curr_obj_shared, lv);
+        uint32_t *linkl = get_level_linklist(state, curr_obj, lv);
         uint32_t *datal = (uint32_t *)(linkl + 1);
 #ifndef NDEBUG
         debug_search_lower_check_list(state, curr_obj, lv, static_cast<uint32_t>(size), linkl, vid, "greedy expand");
@@ -1759,8 +1763,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         float local_best;
         uint32_t local_cand;
         if (tx == 0) {
-          local_best = __int_as_float(curr_dist_bits_shared);
-          local_cand = curr_obj_shared;
+          local_best = curr_dist;
+          local_cand = curr_obj;
         }
         for (int i = ty; i < size; i += nrow) {
           uint32_t cand = datal[i];
@@ -1785,25 +1789,33 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
           warp_best_cand[ty] = local_cand;
         }
         __syncthreads();
-        if (threadIdx.x == 0) {
-          float curr_dist = __int_as_float(curr_dist_bits_shared);
-          for (int w = 0; w < SEARCH_WARP_COUNT; ++w) {
-            if (warp_best_dist[w] < curr_dist) {
-              curr_dist = warp_best_dist[w];
-              curr_obj_shared = warp_best_cand[w];
-              changed = 1;
-            }
+        float best_d = curr_dist;
+        uint32_t best_c = curr_obj;
+        int greedy_changed = 0;
+        for (int w = 0; w < SEARCH_WARP_COUNT; ++w) {
+          if (warp_best_dist[w] < best_d) {
+            best_d = warp_best_dist[w];
+            best_c = warp_best_cand[w];
+            greedy_changed = 1;
           }
+        }
+        curr_dist = best_d;
+        curr_obj = best_c;
+        if (threadIdx.x == 0) {
+          curr_obj_shared = curr_obj;
           curr_dist_bits_shared = __float_as_int(curr_dist);
         }
         __syncthreads();
-        if (!changed) {
+        if (!greedy_changed) {
           break;
         }
       }
       lv--;
     }
     // Search and insert at current level.
+    if (lv > lvl) {  // In case the greedy expansion ends due to break.
+      lv = lvl;
+    }
     while (lv >= 0) {
       if (threadIdx.x == 0) {
 #ifndef NDEBUG
@@ -1819,27 +1831,30 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
       __syncthreads();
 
       while (true) {
+        // All threads compute the stop test from already-volatile queue sizes
+        // so they cannot diverge on a stale shared `search_continue`.
+        const int csz = candq_sz;
+        const int tsz = topq_sz;
+        const int efc = static_cast<int>(state->ef_construction);
+        const int search_cont = (csz > 0) && !(tsz >= efc && candq[0].distance > topq[0].distance);
+        if (!search_cont) {
+          break;
+        }
+
+        // Read the heap root *before* thread 0 pops. nodeid is already volatile.
+        const uint32_t node = static_cast<uint32_t>(candq[0].nodeid);
 #ifndef NDEBUG
         debug_search_lower_check_node_level(state, node, lv, vid, "beam expand");
 #endif
         if (threadIdx.x == 0) {
-          search_continue =
-              (candq_sz > 0) && !(topq_sz >= static_cast<int>(state->ef_construction) && candq[0].distance > topq_max);
-          if (search_continue) {
-            popped = candq[0];
-            visited[popped.nodeid] = visited_tag;
-            MinPqPop(candq, &candq_sz, &popped);
-          }
+          MinPqPop(candq, &candq_sz, &popped);
+          visited[node] = visited_tag;
         }
         __syncthreads();
-        if (!search_continue) {
-          break;
-        }
 
         const int tx = threadIdx.x % warpSize;
         const int ty = threadIdx.x / warpSize;
         const int nrow = blockDim.x / warpSize;
-        const uint32_t node = popped.nodeid;
 
         if (tx == 0) {
           warp_staging_sz[ty] = 0;
@@ -1933,11 +1948,19 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_lv)
         datal[i] = topq[i].nodeid;
         distl[i] = topq[i].distance;
       }
+      // Next-level entry is the closest node in the result set (topq), not the
+      // leftover candidate heap (which can be empty after a full expand).
+      if (topq_sz > 0) {
+        uint32_t entry_id = curr_obj;
+        float entry_dist = curr_dist;
+        find_closest_in_queue(topq, topq_sz, &entry_id, &entry_dist);
+        curr_obj = entry_id;
+        curr_dist = entry_dist;
+      }
       if (threadIdx.x == 0) {
         setListCount(linkl, write_sz);
-        float entry_dist = 0.0f;
-        find_closest_in_queue(candq, candq_sz, &curr_obj_shared, &entry_dist);
-        curr_dist_bits_shared = __float_as_int(entry_dist);
+        curr_obj_shared = curr_obj;
+        curr_dist_bits_shared = __float_as_int(curr_dist);
 #ifndef NDEBUG
         if (curr_obj >= state->max_elements) {
           printf(
