@@ -829,12 +829,25 @@ __device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
       sz = shared_sz;
 
       int M = lv ? state->M : state->maxM0;
-      // The branch that there is no need of pruning.
-      if (sz < M + 1) {  // +1 for self-edge.
-        for (int i = threadIdx.x; i < sz; i += blockDim.x) {
-          datal[i] = ranked_cand[i + 1];
-          distl[i] = ranked_dist[i + 1];
+      // No heuristic prune needed. Still drop the self-edge and publish count
+      // only after neighbor ids are written. Do not assume ranked_cand[0] is
+      // self: this path has not sorted, and ranked_cand[sz] is unfilled.
+      if (sz < static_cast<uint32_t>(M) + 1) {
+        if (threadIdx.x == 0) {
+          uint32_t out = 0;
+          for (uint32_t i = 0; i < sz; ++i) {
+            const uint32_t cand = ranked_cand[i];
+            if (cand == static_cast<uint32_t>(vid) || cand >= state->max_elements ||
+                state->element_levels[cand] < static_cast<uint32_t>(lv)) {
+              continue;
+            }
+            datal[out] = cand;
+            distl[out] = ranked_dist[i];
+            ++out;
+          }
+          setListCount(linkl, out);
         }
+        __syncthreads();
         continue;
       }
 
@@ -940,12 +953,19 @@ __device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
       }
 
       // Still treat as 1d block, adding all the selected edges based on the result.
-      for (int i = threadIdx.x; i < curr_neigh_cnt; i += blockDim.x) {
-        datal[i] = ranked_cand[neigh_rank[i]];
-        distl[i] = ranked_dist[neigh_rank[i]];
-      }
       if (threadIdx.x == 0) {
-        setListCount(linkl, curr_neigh_cnt);
+        uint32_t out = 0;
+        for (uint32_t i = 0; i < curr_neigh_cnt; ++i) {
+          const uint32_t cand = ranked_cand[neigh_rank[i]];
+          if (cand == static_cast<uint32_t>(vid) || cand >= state->max_elements ||
+              state->element_levels[cand] < static_cast<uint32_t>(lv)) {
+            continue;
+          }
+          datal[out] = cand;
+          distl[out] = ranked_dist[neigh_rank[i]];
+          ++out;
+        }
+        setListCount(linkl, out);
       }
       __syncthreads();
     }
