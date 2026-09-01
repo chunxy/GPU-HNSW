@@ -3,6 +3,7 @@
 #include "visited_list_pool.h"
 #include "hnswlib.h"
 #include <atomic>
+#include <cstdint>
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
@@ -65,6 +66,51 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::atomic<long> metric_distance_computations{0};
     mutable std::atomic<long> metric_hops{0};
 
+#ifdef HNSW_COUNT_UPPER_LEVEL_DIST
+    // Optional construction counter: wrap fstdistfunc_ and count calls while
+    // addPoint is on layers > 0 (greedy descent + search/connect, not layer 0).
+    inline static thread_local DISTFUNC<dist_t> tls_raw_distfunc_{nullptr};
+    inline static thread_local uint64_t tls_total_dist_count{0};
+    inline static thread_local uint64_t tls_upper_level_dist_count{0};
+    inline static thread_local int tls_count_upper_level_dist{0};
+
+    static dist_t countingDistTrampoline(const void *a, const void *b, const void *p) {
+        ++tls_total_dist_count;
+        if (tls_count_upper_level_dist) {
+            ++tls_upper_level_dist_count;
+        }
+        return tls_raw_distfunc_(a, b, p);
+    }
+
+    struct CountUpperDistGuard {
+        bool active_;
+        explicit CountUpperDistGuard(bool active) : active_(active) {
+            if (active_) {
+                ++tls_count_upper_level_dist;
+            }
+        }
+        ~CountUpperDistGuard() {
+            if (active_) {
+                --tls_count_upper_level_dist;
+            }
+        }
+        CountUpperDistGuard(const CountUpperDistGuard &) = delete;
+        CountUpperDistGuard &operator=(const CountUpperDistGuard &) = delete;
+    };
+
+    void wrapDistFuncForUpperLevelCount() {
+        tls_raw_distfunc_ = fstdistfunc_;
+        fstdistfunc_ = countingDistTrampoline;
+    }
+
+    static uint64_t getUpperLevelDistCount() { return tls_upper_level_dist_count; }
+    static uint64_t getTotalDistCount() { return tls_total_dist_count; }
+    static void resetDistCounts() {
+        tls_total_dist_count = 0;
+        tls_upper_level_dist_count = 0;
+    }
+#endif
+
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
 
     std::mutex deleted_elements_lock;  // lock for deleted_elements
@@ -102,6 +148,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         data_size_ = s->get_data_size();
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
+#ifdef HNSW_COUNT_UPPER_LEVEL_DIST
+        wrapDistFuncForUpperLevelCount();
+#endif
         if ( M <= 10000 ) {
             M_ = M;
         } else {
@@ -748,6 +797,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         data_size_ = s->get_data_size();
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
+#ifdef HNSW_COUNT_UPPER_LEVEL_DIST
+        wrapDistFuncForUpperLevelCount();
+#endif
 
         auto pos = input.tellg();
 
@@ -1212,6 +1264,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         if ((signed)currObj != -1) {
             if (curlevel < maxlevelcopy) {
+#ifdef HNSW_COUNT_UPPER_LEVEL_DIST
+                CountUpperDistGuard upper_guard(true);
+#endif
                 dist_t curdist = fstdistfunc_(data_point, getDataByInternalId(currObj), dist_func_param_);
                 for (int level = maxlevelcopy; level > curlevel; level--) {
                     bool changed = true;
@@ -1242,6 +1297,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             for (int level = std::min(curlevel, maxlevelcopy); level >= 0; level--) {
                 if (level > maxlevelcopy || level < 0)  // possible?
                     throw std::runtime_error("Level error");
+#ifdef HNSW_COUNT_UPPER_LEVEL_DIST
+                CountUpperDistGuard upper_guard(level > 0);
+#endif
 
                 std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchBaseLayer(
                         currObj, data_point, level);

@@ -12,3 +12,7 @@ target_link_libraries(bench-build-cpu PRIVATE Boost::program_options OpenMP::Ope
 
 add_executable(bench-index-search bench-index-search.cpp)
 target_link_libraries(bench-index-search PRIVATE Boost::program_options)
+
+add_executable(stat-hnsw-cpu-single stat-hnsw-cpu-single.cpp)
+target_link_libraries(stat-hnsw-cpu-single PRIVATE Boost::program_options)
+target_compile_definitions(stat-hnsw-cpu-single PRIVATE HNSW_COUNT_UPPER_LEVEL_DIST=1)
