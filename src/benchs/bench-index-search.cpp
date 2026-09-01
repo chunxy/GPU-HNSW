@@ -27,7 +27,7 @@ struct BenchLoadArgs {
   int k = 10;
   int M = 32;
   int efc = 100;
-  int efs = 100;
+  vector<int> efs = {100};
   std::string hardware;
 };
 
@@ -72,15 +72,10 @@ BenchLoadArgs parse_args(int argc, char **argv) {
       "hardware", po::value<std::string>(&args.hardware)->required(), "Build hardware: GPU|CPU|single-thread CPU");
   desc.add_options()("M", po::value<int>(&args.M)->default_value(args.M), "Graph M");
   desc.add_options()("efc", po::value<int>(&args.efc)->default_value(args.efc), "Construction ef");
-  desc.add_options()("efs", po::value<int>(&args.efs)->default_value(args.efs), "Search ef");
-
-  po::positional_options_description positional;
-  positional.add("datacard", 1);
-  positional.add("k", 1);
-  positional.add("hardware", 1);
+  desc.add_options()("efs", po::value<std::vector<int>>(&args.efs)->required()->multitoken(), "Search ef");
 
   po::variables_map vm;
-  po::store(po::command_line_parser(argc, argv).options(desc).positional(positional).run(), vm);
+  po::store(po::command_line_parser(argc, argv).options(desc).run(), vm);
   if (vm.count("help") > 0) {
     std::cout << desc << '\n';
     std::exit(0);
@@ -136,51 +131,54 @@ int main(int argc, char **argv) {
   hnswlib::HierarchicalNswLite<float> index(&space);
   index.loadIndex(index_path.string(), &space, c.n_base);
   index.checkIntegrity();
-  index.setEf(std::max(args.k, args.efs));
-
-  size_t hit_count = 0;
-  auto t0 = std::chrono::steady_clock::now();
-  for (size_t qi = 0; qi < c.n_queries; ++qi) {
-    auto result = index.searchKnn(xq + qi * c.vector_dim, args.k);
-    std::unordered_set<uint32_t> gt_set;
-    gt_set.reserve(args.k);
-    for (int j = 0; j < args.k; ++j) {
-      gt_set.insert(gt[qi][j]);
-    }
-    while (!result.empty()) {
-      const uint32_t id = static_cast<uint32_t>(result.top().second);
-      result.pop();
-      if (gt_set.find(id) != gt_set.end()) {
-        hit_count++;
+  for (int efs : args.efs) {
+    index.setEf(std::max(args.k, efs));
+    size_t hit_count = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    for (size_t qi = 0; qi < c.n_queries; ++qi) {
+      auto result = index.searchKnn(xq + qi * c.vector_dim, args.k);
+      std::unordered_set<uint32_t> gt_set;
+      gt_set.reserve(args.k);
+      for (int j = 0; j < args.k; ++j) {
+        gt_set.insert(gt[qi][j]);
+      }
+      while (!result.empty()) {
+        const uint32_t id = static_cast<uint32_t>(result.top().second);
+        result.pop();
+        if (gt_set.find(id) != gt_set.end()) {
+          hit_count++;
+        }
       }
     }
+    auto t1 = std::chrono::steady_clock::now();
+
+    const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+    const double recall = static_cast<double>(hit_count) / static_cast<double>(c.n_queries * args.k);
+    const double qps = static_cast<double>(c.n_queries) / elapsed_s;
+
+    nlohmann::json json;
+    json["recall"] = recall;
+    json["qps"] = qps;
+    json["dataset"] = args.datacard;
+    json["hardware"] = log_hardware;
+    json["build"] = {{"M", args.M}, {"efc", args.efc}};
+    json["search"] = {{"k", args.k}, {"efs", efs}};
+
+    time_t ts = time(nullptr);
+    auto tm = localtime(&ts);
+    const std::string json_file = fmt::format("{:%Y-%m-%d-%H-%M-%S}.json", *tm);
+    const fs::path json_path = fs::path(LOGS) / log_hardware / args.datacard /
+                               fmt::format("M_{}_efc_{}", args.M, args.efc) / fmt::format("k_{}_efs_{}", args.k, efs) /
+                               json_file;
+    fs::create_directories(json_path.parent_path());
+    std::ofstream ofs(json_path.string());
+    ofs << json.dump(4);
+    ofs.close();
+
+    fmt::print("Recall: {:.6f}\n", recall);
+    fmt::print("QPS: {:.2f}\n", qps);
+    fmt::print("Saved to {}\n", json_path.string());
   }
-  auto t1 = std::chrono::steady_clock::now();
 
-  const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-  const double recall = static_cast<double>(hit_count) / static_cast<double>(c.n_queries * args.k);
-  const double qps = static_cast<double>(c.n_queries) / elapsed_s;
-
-  nlohmann::json json;
-  json["recall"] = recall;
-  json["qps"] = qps;
-  json["dataset"] = args.datacard;
-  json["hardware"] = log_hardware;
-  json["build"] = {{"M", args.M}, {"efc", args.efc}};
-  json["search"] = {{"k", args.k}, {"efs", std::max(args.k, args.efs)}};
-
-  time_t ts = time(nullptr);
-  auto tm = localtime(&ts);
-  const std::string json_file = fmt::format("{:%Y-%m-%d-%H-%M-%S}.json", *tm);
-  const fs::path json_path =
-      fs::path(LOGS) / log_hardware / args.datacard / fmt::format("M_{}_efc_{}", args.M, args.efc) / json_file;
-  fs::create_directories(json_path.parent_path());
-  std::ofstream ofs(json_path.string());
-  ofs << json.dump(4);
-  ofs.close();
-
-  fmt::print("Recall: {:.6f}\n", recall);
-  fmt::print("QPS: {:.2f}\n", qps);
-  fmt::print("Saved to {}\n", json_path.string());
   return 0;
 }

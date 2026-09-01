@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
   hnswlib::HierarchicalNswLite<float> index(&space, c.n_base, args.M, args.efc);
   std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   // set the number of threads to the number of cores in the system
-  omp_set_num_threads(omp_get_num_procs() / 2);
+  omp_set_num_threads(omp_get_num_procs());
   // omp_set_num_threads(1);
 #pragma omp parallel for
   for (size_t i = 0; i < c.n_base; ++i) {

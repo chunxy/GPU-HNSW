@@ -10,9 +10,9 @@ endif()
 # enable_language(CUDA)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     # -G for device debugging
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -O0 --ptxas-options=-v")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g --ptxas-options=-v")
 else()
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 endif()
 set(CUDAToolkit_ROOT "/usr/local/cuda-12.3/")
 # "native" can fail under some environments (e.g. WSL/sandboxed builds) and

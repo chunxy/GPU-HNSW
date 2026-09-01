@@ -55,16 +55,5 @@ int main(int argc, char **argv) {
 
   fmt::print("Build time: {:.2f} seconds\n", duration.count());
 
-  time_t ts = time(nullptr);
-  auto tm = localtime(&ts);
-  std::string json_file = fmt::format("{:%Y-%m-%d-%H-%M-%S}.json", *tm);
-
-  fs::path json_path = fs::path(LOGS) / method / workload / build / json_file;
-  fs::create_directories(json_path.parent_path());
-  fmt::print("Saving to {}\n", json_path.string());
-  std::ofstream ofs(json_path.string());
-  ofs << json.dump(4);
-  ofs.close();
-
   return 0;
 }
