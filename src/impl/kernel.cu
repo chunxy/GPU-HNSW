@@ -1269,11 +1269,8 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
 
 // 1d grid, 1d block
 __device__ void compute_power_kernel(GpuGraphState *state) {
-  int bid = blockIdx.x;
-  if (bid >= state->max_elements) {
-    return;
-  }
   __shared__ float cache[MAX_DIM];
+  int bid = blockIdx.x;
   while (bid < state->max_elements) {
     int vector_start = bid * state->vector_dim;
     int vector_end = vector_start + state->vector_dim;
@@ -1288,7 +1285,7 @@ __device__ void compute_power_kernel(GpuGraphState *state) {
     cache[cid] = temp;
     __syncthreads();
 
-    int active_threads = state->vector_dim;
+    int active_threads = blockDim.x;
     while (active_threads > 1) {
       int half = active_threads / 2;
       if (cid < half) {
