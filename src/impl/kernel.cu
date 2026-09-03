@@ -514,35 +514,35 @@ __device__ void compute_new_new_dist_kernel(GpuGraphState *state) {
   constexpr int kStride = LEVEL_SZ_THRES + BATCHSZ_PER_NEW;
   constexpr int kColOff = LEVEL_SZ_THRES;
 
-    namespace wmma = nvcuda::wmma;
-    constexpr int kWmmaM = 16;
-    constexpr int kWmmaN = 16;
-    constexpr int kWmmaK = 16;
+  namespace wmma = nvcuda::wmma;
+  constexpr int kWmmaM = 16;
+  constexpr int kWmmaN = 16;
+  constexpr int kWmmaK = 16;
   const int warps_per_block = blockDim.x / warpSize;
-    const int warp_id = threadIdx.x / warpSize;
+  const int warp_id = threadIdx.x / warpSize;
   const int global_warp = blockIdx.x * warps_per_block + warp_id;
   const int total_warps = gridDim.x * warps_per_block;
-    const int tile_cols = new_count / kWmmaN;
-    const int tile_rows = new_count / kWmmaM;
-    const int tile_count = tile_rows * tile_cols;
+  const int tile_cols = new_count / kWmmaN;
+  const int tile_rows = new_count / kWmmaM;
+  const int tile_count = tile_rows * tile_cols;
   __shared__ float ip_tile[BLOCK_DIM / 32][kWmmaM * kWmmaN];
 
   for (int tile_idx = global_warp; tile_idx < tile_count; tile_idx += total_warps) {
     const int new_row = (tile_idx / tile_cols) * kWmmaM;
     const int new_col = (tile_idx % tile_cols) * kWmmaN;
 
-        wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
+    wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
 
-        for (int k = 0; k < state->vector_dim; k += kWmmaK) {
-          wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK, half, wmma::row_major> a_frag;
-          wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK, half, wmma::col_major> b_frag;
-          const half *a_ptr = new_vector_store + new_row * state->vector_dim + k;
-          const half *b_ptr = new_vector_store + new_col * state->vector_dim + k;
-          wmma::load_matrix_sync(a_frag, a_ptr, state->vector_dim);
-          wmma::load_matrix_sync(b_frag, b_ptr, state->vector_dim);
-          wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
+    for (int k = 0; k < state->vector_dim; k += kWmmaK) {
+      wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK, half, wmma::row_major> a_frag;
+      wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK, half, wmma::col_major> b_frag;
+      const half *a_ptr = new_vector_store + new_row * state->vector_dim + k;
+      const half *b_ptr = new_vector_store + new_col * state->vector_dim + k;
+      wmma::load_matrix_sync(a_frag, a_ptr, state->vector_dim);
+      wmma::load_matrix_sync(b_frag, b_ptr, state->vector_dim);
+      wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
 
     wmma::store_matrix_sync(&ip_tile[warp_id][0], c_frag, kWmmaN, wmma::mem_row_major);
     __syncwarp();
@@ -561,8 +561,8 @@ __device__ void compute_new_new_dist_kernel(GpuGraphState *state) {
   }
 
   if (new_count % 16 != 0) {
-  const int wmma_rows = (new_count / 16) * 16;
-  const int wmma_cols = (new_count / 16) * 16;
+    const int wmma_rows = (new_count / 16) * 16;
+    const int wmma_cols = (new_count / 16) * 16;
     const int total = new_count * new_count;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += gridDim.x * blockDim.x) {
       const int i = idx / new_count;
@@ -575,7 +575,7 @@ __device__ void compute_new_new_dist_kernel(GpuGraphState *state) {
         ip += __half2float(new_vector_store[row_st + k]) * __half2float(new_vector_store[col_st + k]);
       }
       const int out_idx = i * kStride + kColOff + j;
-    const uint32_t one = batch_base + i;
+      const uint32_t one = batch_base + i;
       const uint32_t another = batch_base + j;
       state->news_dist[out_idx] = -2 * ip + state->vector_powers[one] + state->vector_powers[another];
       state->news_rank[out_idx] = another;
@@ -740,6 +740,7 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
         other_datal[other_pos] = vid;
         other_distl[other_pos] = ranked_dist[neigh_rank[i]];
       }
+      // __syncthreads();
     }
   }
 }
@@ -1955,8 +1956,6 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
         }
 #endif
       }
-      __syncthreads();
-
       lv--;
       __syncthreads();
     }
