@@ -1672,10 +1672,12 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
     visited_wrap = 0;
   }
   __syncthreads();
-  for (int i = threadIdx.x; i < state->max_elements; i += blockDim.x) {
-    visited[i] = -1;
-  }
-  __syncthreads();
+#ifdef PROFILE_BUILD_PHASES
+  uint64_t n_expand = 0;
+  uint64_t clear_cycles = 0;
+  uint64_t t_mark = 0;
+  if (state->profile_build_phases && threadIdx.x == 0) t_mark = clock64();
+#endif
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
 #ifndef NDEBUG
