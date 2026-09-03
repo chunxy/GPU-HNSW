@@ -837,8 +837,7 @@ __device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
           uint32_t out = 0;
           for (uint32_t i = 0; i < sz; ++i) {
             const uint32_t cand = ranked_cand[i];
-            if (cand == static_cast<uint32_t>(vid) || cand >= state->max_elements ||
-                state->element_levels[cand] < static_cast<uint32_t>(lv)) {
+            if (cand == static_cast<uint32_t>(vid)) {
               continue;
             }
             datal[out] = cand;
@@ -875,14 +874,13 @@ __device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
       debug_check_pruned_mask_range(sz, "combine_prune_for_new", vid, lv);
 #endif
       for (int i = threadIdx.x; i < sz; i += blockDim.x) {
-        pruned_mask[i] = 0;
+        pruned_mask[i] = (ranked_cand[i] == vid) ? 1 : 0;
       }
       __syncthreads();
 
       if (threadIdx.x == 0) {
-        pruned_mask[0] = 1;  // Avoid self-edge.
         curr_neigh_cnt = 0;
-        for (int i = 1; i < sz; i++) {
+        for (int i = 0; i < sz; i++) {
           if (pruned_mask[i] == 0) {
             prev_neigh_rank = i;
             prev_neigh_id = ranked_cand[i];
