@@ -50,9 +50,9 @@ static const std::string flickr_bpath = "/opt/nfs_dcc/chunxy/SVS/flickr/flickr_b
 static const std::string flickr_qpath = "/opt/nfs_dcc/chunxy/SVS/flickr/flickr_query.fvecs";
 static const std::string flickr_gpath = "/opt/nfs_dcc/chunxy/SVS/flickr/flickr_groundtruth.ivecs";
 
-static const std::string deep10m_bpath = "/opt/nfs_dcc/chunxy/datasets/deep10m/deep10m_base.fvecs";
-static const std::string deep10m_qpath = "/opt/nfs_dcc/chunxy/datasets/deep10m/deep10m_query.fvecs";
-static const std::string deep10m_gpath = "/opt/nfs_dcc/chunxy/datasets/deep10m/deep10m_groundtruth.ivecs";
+static const std::string deep10m_bpath = "/home/sean/datasets/deep10m/deep10m_base.fvecs";
+static const std::string deep10m_qpath = "/home/sean/datasets/deep10m/deep10m_query.fvecs";
+static const std::string deep10m_gpath = "/home/sean/datasets/deep10m/deep10m_groundtruth.ivecs";
 
 static const std::string word2vec_bpath = "/opt/nfs_dcc/chunxy/datasets/word2vec/word2vec_base.fvecs";
 static const std::string word2vec_qpath = "/opt/nfs_dcc/chunxy/datasets/word2vec/word2vec_query.fvecs";
@@ -157,6 +157,17 @@ DataCard gist_dedup{
     100,
 };
 
+DataCard deep10m{
+    "deep10m",
+    deep10m_bpath,
+    deep10m_qpath,
+    deep10m_gpath,
+    96,
+    10000000,
+    10000,
+    100,
+};
+
 std::map<std::string, DataCard> name_to_card{
     {"siftsmall", siftsmall},
     {"sift", sift},
@@ -168,6 +179,6 @@ std::map<std::string, DataCard> name_to_card{
     {"sift-dedup", sift_dedup},
     {"gist-dedup", gist_dedup},
     // {"flickr", flickr},
-    // {"deep10m", deep10m},
+    {"deep10m", deep10m},
     // {"word2vec", word2vec},
 };
