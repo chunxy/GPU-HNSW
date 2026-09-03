@@ -246,6 +246,9 @@ class HierarchicalNswLite {
   void release_gpu_state() {
 #ifdef PROFILE_BUILD_PHASES
     cuda_free_buffer(host_gpu_graph_state_.build_phase_cycles);
+    cuda_free_buffer(host_gpu_graph_state_.search_block_cycles);
+    cuda_free_buffer(host_gpu_graph_state_.search_block_clear_cycles);
+    cuda_free_buffer(host_gpu_graph_state_.search_block_expands);
 #endif
     cuda_free_buffer(host_gpu_graph_state_.precomputed_new_new_dist);
     cuda_free_buffer(host_gpu_graph_state_.precomputed_new_new_rank);
@@ -255,6 +258,7 @@ class HierarchicalNswLite {
     cuda_free_buffer(host_gpu_graph_state_.changed_old_links);
     cuda_free_buffer(host_gpu_graph_state_.changed_old_link_counts);
     cuda_free_buffer(host_gpu_graph_state_.old_vector_store);
+    cuda_free_buffer(host_gpu_graph_state_.visited_tags);
     cuda_free_buffer(device_gpu_graph_state_);
 
     device_gpu_graph_state_ = nullptr;
@@ -1054,6 +1058,8 @@ class HierarchicalNswLite {
     gpuMemset(host_gpu_graph_state_.link_lists, 0, sizeof(char *) * gpu_max_elements);
     gpuMalloc(&host_gpu_graph_state_.visited, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
     gpuMemset(host_gpu_graph_state_.visited, 0, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
+    gpuMalloc(&host_gpu_graph_state_.visited_tags, sizeof(uint32_t) * GRID_DIM);
+    gpuMemset(host_gpu_graph_state_.visited_tags, 0, sizeof(uint32_t) * GRID_DIM);
     gpuMalloc(&host_gpu_graph_state_.frozen_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
     gpuMemset(host_gpu_graph_state_.frozen_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
     // There are at most BATCHSZ_PER_NEW * maxM0_ changed old links per level.
@@ -1075,6 +1081,13 @@ class HierarchicalNswLite {
 #ifdef PROFILE_BUILD_PHASES
     gpuMalloc(&host_gpu_graph_state_.build_phase_cycles, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount));
     gpuMemset(host_gpu_graph_state_.build_phase_cycles, 0, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount));
+    const size_t search_block_profile_count = num_new_new_batches * static_cast<size_t>(GRID_DIM);
+    gpuMalloc(&host_gpu_graph_state_.search_block_cycles, sizeof(uint64_t) * search_block_profile_count);
+    gpuMemset(host_gpu_graph_state_.search_block_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
+    gpuMalloc(&host_gpu_graph_state_.search_block_clear_cycles, sizeof(uint64_t) * search_block_profile_count);
+    gpuMemset(host_gpu_graph_state_.search_block_clear_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
+    gpuMalloc(&host_gpu_graph_state_.search_block_expands, sizeof(uint64_t) * search_block_profile_count);
+    gpuMemset(host_gpu_graph_state_.search_block_expands, 0, sizeof(uint64_t) * search_block_profile_count);
     host_gpu_graph_state_.profile_build_phases = profile_build_phases_;
     host_gpu_graph_state_.build_batch_count = 0;
 #endif
@@ -1281,6 +1294,30 @@ class HierarchicalNswLite {
           sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount),
           cudaMemcpyDeviceToHost));
       print_build_phase_profile(phase_cycles.data(), device_state.build_batch_count);
+      if (device_state.build_batch_count > 0) {
+        const size_t search_block_profile_count =
+            static_cast<size_t>(device_state.build_batch_count) * static_cast<size_t>(GRID_DIM);
+        std::vector<uint64_t> search_cycles(search_block_profile_count, 0ULL);
+        std::vector<uint64_t> search_clear(search_block_profile_count, 0ULL);
+        std::vector<uint64_t> search_expands(search_block_profile_count, 0ULL);
+        CUDA_CHECK(cudaMemcpy(
+            search_cycles.data(),
+            device_state.search_block_cycles,
+            sizeof(uint64_t) * search_block_profile_count,
+            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(
+            search_clear.data(),
+            device_state.search_block_clear_cycles,
+            sizeof(uint64_t) * search_block_profile_count,
+            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(
+            search_expands.data(),
+            device_state.search_block_expands,
+            sizeof(uint64_t) * search_block_profile_count,
+            cudaMemcpyDeviceToHost));
+        print_search_block_profile(
+            search_cycles.data(), search_clear.data(), search_expands.data(), device_state.build_batch_count);
+      }
       profile_build_phases_ = false;
       host_gpu_graph_state_.profile_build_phases = false;
       CUDA_CHECK(cudaMemcpy(

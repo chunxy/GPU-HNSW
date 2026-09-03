@@ -1631,6 +1631,7 @@ debug_search_lower_check_cand(GpuGraphState *state, uint32_t cand, uint32_t from
 __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int startup_lv) {
   __shared__ uint32_t *visited;
   __shared__ uint32_t visited_tag;
+  __shared__ int visited_wrap;
   __shared__ Neighbor candq[CANDQ_SZ];
   __shared__ volatile int candq_sz;
   __shared__ Neighbor topq[TOPQ_SZ];
@@ -1646,8 +1647,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
 #ifndef NDEBUG
   if (threadIdx.x == 0) {
-    if (state->visited == nullptr) {
-      printf("Fatal: search_knn_at_lower: visited is null\n");
+    if (state->visited == nullptr || state->visited_tags == nullptr) {
+      printf("Fatal: search_knn_at_lower: visited/visited_tags is null\n");
       assert(false);
     }
     if (state->vector_data == nullptr) {
@@ -1667,7 +1668,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
 #endif
   if (threadIdx.x == 0) {
     visited = state->visited + blockIdx.x * state->max_elements;
-    visited_tag = 0;
+    visited_tag = state->visited_tags[blockIdx.x];
+    visited_wrap = 0;
   }
   __syncthreads();
   for (int i = threadIdx.x; i < state->max_elements; i += blockDim.x) {
@@ -1822,8 +1824,25 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
         MaxPqPush(topq, &topq_sz, curr_dist, curr_obj, 1);
         topq_max = curr_dist;
         ++visited_tag;
+        visited_wrap = (visited_tag == 0);
+        if (visited_wrap) visited_tag = 1;
       }
       __syncthreads();
+      if (visited_wrap) {
+#ifdef PROFILE_BUILD_PHASES
+        uint64_t t_clear = 0;
+        if (state->profile_build_phases && threadIdx.x == 0) t_clear = clock64();
+#endif
+        for (int i = threadIdx.x; i < state->max_elements; i += blockDim.x) {
+          visited[i] = 0;
+        }
+        __syncthreads();
+#ifdef PROFILE_BUILD_PHASES
+        if (state->profile_build_phases && threadIdx.x == 0) {
+          clear_cycles += clock64() - t_clear;
+        }
+#endif
+      }
 
       while (true) {
         // All threads compute the stop test from already-volatile queue sizes
@@ -1835,6 +1854,11 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
         if (!search_cont) {
           break;
         }
+#ifdef PROFILE_BUILD_PHASES
+        if (state->profile_build_phases && threadIdx.x == 0) {
+          ++n_expand;
+        }
+#endif
 
         // Read the heap root *before* thread 0 pops. nodeid is already volatile.
         const uint32_t node = static_cast<uint32_t>(candq[0].nodeid);
@@ -1976,10 +2000,25 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
       __syncthreads();
     }
   }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    state->visited_tags[blockIdx.x] = visited_tag;
+#ifdef PROFILE_BUILD_PHASES
+    if (state->profile_build_phases) {
+      const uint32_t batch = state->cur_element_count / BATCHSZ_PER_NEW;
+      const uint32_t idx = batch * GRID_DIM + blockIdx.x;
+      state->search_block_cycles[idx] = clock64() - t_mark;
+      state->search_block_clear_cycles[idx] = clear_cycles;
+      state->search_block_expands[idx] = n_expand;
+    }
+#endif
+  }
 }
 
 #ifdef PROFILE_BUILD_PHASES
+#include <algorithm>
 #include <fmt/format.h>
+#include <vector>
 
 void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count) {
   if (batch_count == 0 || cycles == nullptr) {
@@ -2016,5 +2055,135 @@ void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count) {
         pct,
         phase_ms[phase] / batch_count);
   }
+}
+
+namespace {
+
+double percentile_sorted(const std::vector<double> &sorted, double p) {
+  if (sorted.empty()) return 0.0;
+  const double idx = p * static_cast<double>(sorted.size() - 1);
+  const size_t lo = static_cast<size_t>(idx);
+  const size_t hi = std::min(lo + 1, sorted.size() - 1);
+  const double frac = idx - static_cast<double>(lo);
+  return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+}
+
+void summarize_batch_imbalance(
+    const uint64_t *values, uint64_t batch_begin, uint64_t batch_end, const char *label) {
+  std::vector<double> ratios;
+  ratios.reserve(static_cast<size_t>(batch_end - batch_begin));
+  double sum_idle = 0.0;
+  double sum_max_mean = 0.0;
+  uint64_t global_min = ~0ULL;
+  uint64_t global_max = 0;
+  for (uint64_t b = batch_begin; b < batch_end; ++b) {
+    const uint64_t *row = values + b * GRID_DIM;
+    uint64_t mn = ~0ULL;
+    uint64_t mx = 0;
+    unsigned long long sum = 0;
+    for (int blk = 0; blk < GRID_DIM; ++blk) {
+      const uint64_t v = row[blk];
+      mn = std::min(mn, v);
+      mx = std::max(mx, v);
+      sum += v;
+    }
+    const double mean = static_cast<double>(sum) / GRID_DIM;
+    const double ratio = mean > 0.0 ? static_cast<double>(mx) / mean : 0.0;
+    const double idle = mx > 0 ? 1.0 - mean / static_cast<double>(mx) : 0.0;
+    ratios.push_back(ratio);
+    sum_idle += idle;
+    sum_max_mean += ratio;
+    global_min = std::min(global_min, mn);
+    global_max = std::max(global_max, mx);
+  }
+  const double n = static_cast<double>(batch_end - batch_begin);
+  std::sort(ratios.begin(), ratios.end());
+  fmt::print(
+      "  {} batches [{}..{}]: max/mean p50={:.3f} p95={:.3f} avg={:.3f}  "
+      "avg idle={:.1f}%  block min/max (any batch)={}/{}\n",
+      label,
+      batch_begin,
+      batch_end - 1,
+      percentile_sorted(ratios, 0.50),
+      percentile_sorted(ratios, 0.95),
+      sum_max_mean / n,
+      100.0 * sum_idle / n,
+      global_min,
+      global_max);
+}
+
+}  // namespace
+
+void print_search_block_profile(
+    const uint64_t *block_cycles,
+    const uint64_t *block_clear_cycles,
+    const uint64_t *block_expands,
+    uint64_t batch_count) {
+  if (batch_count == 0 || block_cycles == nullptr) {
+    fmt::print("search_knn load profile: no batches recorded\n");
+    return;
+  }
+
+  int clock_rate_khz = 0;
+  cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, 0);
+  if (clock_rate_khz <= 0) {
+    fmt::print("search_knn load profile: unable to read GPU clock rate\n");
+    return;
+  }
+  const double cycles_per_ms = clock_rate_khz;
+
+  unsigned long long sum_max_search = 0;
+  unsigned long long sum_mean_search = 0;
+  unsigned long long sum_max_clear = 0;
+  unsigned long long sum_expands = 0;
+  for (uint64_t b = 0; b < batch_count; ++b) {
+    uint64_t mx_search = 0;
+    uint64_t mx_clear = 0;
+    unsigned long long row_search = 0;
+    for (int blk = 0; blk < GRID_DIM; ++blk) {
+      const uint64_t search = block_cycles[b * GRID_DIM + blk];
+      const uint64_t clear = block_clear_cycles[b * GRID_DIM + blk];
+      mx_search = std::max(mx_search, search);
+      mx_clear = std::max(mx_clear, clear);
+      row_search += search;
+      sum_expands += block_expands[b * GRID_DIM + blk];
+    }
+    sum_max_search += mx_search;
+    sum_max_clear += mx_clear;
+    sum_mean_search += row_search / GRID_DIM;
+  }
+
+  fmt::print(
+      "search_knn_at_lower load profile ({} batches, {} blocks, ~{} vectors/block):\n",
+      batch_count,
+      GRID_DIM,
+      BATCHSZ_PER_NEW / GRID_DIM);
+  fmt::print(
+      "  visited_clear max-block sum {:>10.3f} ms  ({:.3f} ms/batch)  — equal work across blocks\n",
+      sum_max_clear / cycles_per_ms,
+      (sum_max_clear / cycles_per_ms) / batch_count);
+  fmt::print(
+      "  search loop   max-block sum {:>10.3f} ms  ({:.3f} ms/batch)  — kernel time follows the slowest block\n",
+      sum_max_search / cycles_per_ms,
+      (sum_max_search / cycles_per_ms) / batch_count);
+  fmt::print(
+      "  search loop   mean-block sum {:>10.3f} ms  (mean/max={:.3f}; gap is imbalance tail)\n",
+      sum_mean_search / cycles_per_ms,
+      sum_max_search > 0 ? static_cast<double>(sum_mean_search) / static_cast<double>(sum_max_search) : 0.0);
+  fmt::print(
+      "  beam expansions total {}  ({:.1f} per block-batch)\n",
+      sum_expands,
+      static_cast<double>(sum_expands) / (static_cast<double>(batch_count) * GRID_DIM));
+
+  fmt::print("  cycle imbalance (search loop, per-batch max/mean over {} blocks):\n", GRID_DIM);
+  summarize_batch_imbalance(block_cycles, 0, batch_count, "all");
+  const uint64_t early_end = std::max<uint64_t>(1, batch_count / 10);
+  const uint64_t late_begin = batch_count - early_end;
+  summarize_batch_imbalance(block_cycles, 0, early_end, "early 10%");
+  summarize_batch_imbalance(block_cycles, late_begin, batch_count, "late 10%");
+  fmt::print("  expansion imbalance (per-batch max/mean over {} blocks):\n", GRID_DIM);
+  summarize_batch_imbalance(block_expands, 0, batch_count, "all");
+  summarize_batch_imbalance(block_expands, 0, early_end, "early 10%");
+  summarize_batch_imbalance(block_expands, late_begin, batch_count, "late 10%");
 }
 #endif  // PROFILE_BUILD_PHASES

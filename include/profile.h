@@ -47,4 +47,10 @@ inline const char *build_phase_name(BuildPhase phase) {
 
 void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count);
 
+void print_search_block_profile(
+    const uint64_t *block_cycles,
+    const uint64_t *block_clear_cycles,
+    const uint64_t *block_expands,
+    uint64_t batch_count);
+
 #endif  // PROFILE_BUILD_PHASES

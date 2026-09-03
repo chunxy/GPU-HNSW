@@ -61,6 +61,9 @@ struct GpuGraphState {
   float *news_dist{nullptr};
   uint32_t *news_rank{nullptr};
   uint32_t *visited{nullptr};
+  // Per-block generation counters for `visited`. Persist across batches so a
+  // block only memsets its slice when the tag wraps.
+  uint32_t *visited_tags{nullptr};
   uint32_t *frozen_link_counts{nullptr};
   uint32_t *changed_old_links{nullptr};
   uint32_t *changed_old_link_counts{nullptr};
@@ -69,6 +72,10 @@ struct GpuGraphState {
   bool profile_build_phases{false};
   uint64_t *build_phase_cycles{nullptr};
   uint64_t build_batch_count{0};
+  // search_knn_at_lower: per (batch, block) counters, layout batch * GRID_DIM + blockIdx
+  uint64_t *search_block_cycles{nullptr};
+  uint64_t *search_block_clear_cycles{nullptr};
+  uint64_t *search_block_expands{nullptr};
 #endif
 };
 
