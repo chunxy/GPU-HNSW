@@ -347,8 +347,8 @@ cudaError_t launch_prepare_graph_kernel(GpuGraphState *state) {
 }
 
 __device__ void copy_float_to_half_kernel(GpuGraphState *state) {
-  int wid = threadIdx.x + blockDim.x * blockIdx.x;
-  for (int i = wid; i < state->max_elements * state->vector_dim; i += blockDim.x * gridDim.x) {
+  const size_t n = static_cast<size_t>(state->max_elements) * state->vector_dim;
+  for (size_t i = threadIdx.x + blockDim.x * blockIdx.x; i < n; i += blockDim.x * gridDim.x) {
     state->half_vector_data[i] = __float2half(state->vector_data[i]);
   }
 }
@@ -513,7 +513,7 @@ __device__ void compute_new_new_dist_into_buffers(
     uint32_t rank_row_stride) {
   if (new_count == 0) return;
 
-  half *new_vector_store = state->half_vector_data + batch_base * state->vector_dim;
+  half *new_vector_store = state->half_vector_data + static_cast<size_t>(batch_base) * state->vector_dim;
 
   // compute new-new inner products using tensor core
   {
@@ -698,14 +698,14 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
           can_continue = 0;
         }
         __syncthreads();
-        const float *prev_vec = state->vector_data + prev_neigh_id * state->vector_dim;
+        const float *prev_vec = state->vector_data + static_cast<size_t>(prev_neigh_id) * state->vector_dim;
         for (int i = ty; i < state->old_vec_fetch_offset; i += nrow) {
           if (i <= prev_neigh_rank) continue;
           if (pruned_mask[i] == 0) {
             can_continue = 1;
             float dist = 0.0f;
             int cand = ranked_cand[i];
-            const float *cand_vec = state->vector_data + cand * state->vector_dim;
+            const float *cand_vec = state->vector_data + static_cast<size_t>(cand) * state->vector_dim;
             // TODO: warp-level sync
             for (int j = tx; j < state->vector_dim; j += warpSize) {
               float diff = cand_vec[j] - prev_vec[j];
@@ -910,14 +910,14 @@ __device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
           can_continue = 0;
         }
         __syncthreads();
-        const float *prev_vec = state->vector_data + prev_neigh_id * state->vector_dim;
+        const float *prev_vec = state->vector_data + static_cast<size_t>(prev_neigh_id) * state->vector_dim;
         for (int i = ty; i < sz; i += nrow) {
           if (i <= prev_neigh_rank) continue;
           if (pruned_mask[i] == 0) {
             can_continue = 1;
             float dist = 0.0f;
             int cand = ranked_cand[i];
-            const float *cand_vec = state->vector_data + cand * state->vector_dim;
+            const float *cand_vec = state->vector_data + static_cast<size_t>(cand) * state->vector_dim;
             for (int j = tx; j < state->vector_dim; j += warpSize) {
               float diff = cand_vec[j] - prev_vec[j];
               dist += diff * diff;
@@ -1270,9 +1270,9 @@ __device__ void compute_power_kernel(GpuGraphState *state) {
   __shared__ float cache[MAX_DIM];
   int bid = blockIdx.x;
   while (bid < state->max_elements) {
-    int vector_start = bid * state->vector_dim;
-    int vector_end = vector_start + state->vector_dim;
-    int wid = vector_start + threadIdx.x;
+    size_t vector_start = static_cast<size_t>(bid) * state->vector_dim;
+    size_t vector_end = vector_start + state->vector_dim;
+    size_t wid = vector_start + threadIdx.x;
     int cid = threadIdx.x;
     float temp = 0.0f;
     // TODO: Rewrite this to intra-warp reduction.
@@ -1326,7 +1326,7 @@ __device__ void generate_random_levels_kernel(GpuGraphState *state) {
 
 // 1d grid, 1d block, 1 block per batch of old vectors
 __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
-  half *new_vector_store = state->half_vector_data + state->cur_element_count * state->vector_dim;
+  half *new_vector_store = state->half_vector_data + static_cast<size_t>(state->cur_element_count) * state->vector_dim;
   half *old_vector_store = state->old_vector_store;
 
   for (int bid = blockIdx.x; bid * BATCHSZ_PER_OLD < state->old_vec_fetch_offset; bid += gridDim.x) {
@@ -1338,7 +1338,7 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
       continue;
     }
     for (uint32_t i = 0; i < old_count; ++i) {
-      const uint32_t vector_st = state->old_vector_fetch_index[i + oid] * state->vector_dim;
+      const size_t vector_st = static_cast<size_t>(state->old_vector_fetch_index[i + oid]) * state->vector_dim;
       const uint32_t old_vector_store_st = (i + oid) * state->vector_dim;
       for (int j = threadIdx.x; j < state->vector_dim; j += blockDim.x) {
         old_vector_store[old_vector_store_st + j] = state->half_vector_data[vector_st + j];
@@ -1467,7 +1467,7 @@ __device__ void prune_for_old_kernel(GpuGraphState *state) {
           const int tx = threadIdx.x % warpSize;  // compute distance along this dimension
           const int ty = threadIdx.x / warpSize;  // compute for different candidates
           const int nrow = blockDim.x / warpSize;
-          const float *prev_vec = state->vector_data + prev_neigh_id * state->vector_dim;
+          const float *prev_vec = state->vector_data + static_cast<size_t>(prev_neigh_id) * state->vector_dim;
 
           for (int i = ty; i < sz; i += nrow) {
             if (i <= prev_neigh_rank) continue;
@@ -1475,7 +1475,7 @@ __device__ void prune_for_old_kernel(GpuGraphState *state) {
               can_continue = 1;
               float dist = 0.0f;
               const int cand = datal[i];
-              const float *cand_vec = state->vector_data + cand * state->vector_dim;
+              const float *cand_vec = state->vector_data + static_cast<size_t>(cand) * state->vector_dim;
               for (int j = tx; j < state->vector_dim; j += warpSize) {
                 float diff = cand_vec[j] - prev_vec[j];
                 dist += diff * diff;
@@ -1692,7 +1692,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
     const int ty = threadIdx.x / warpSize;
     const int nrow = blockDim.x / warpSize;
 
-    float *query_vec = state->vector_data + vid * state->vector_dim;
+    float *query_vec = state->vector_data + static_cast<size_t>(vid) * state->vector_dim;
     // Find the entry point
     if (threadIdx.x == 0) {
       auto ranks = state->news_rank + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
@@ -1768,7 +1768,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
 #endif
           float dist = 0.0f;
           for (int j = tx; j < state->vector_dim; j += warpSize) {
-            const float diff = state->vector_data[cand * state->vector_dim + j] - query_vec[j];
+            const float diff = state->vector_data[static_cast<size_t>(cand) * state->vector_dim + j] - query_vec[j];
             dist += diff * diff;
           }
           for (int lane = warpSize / 2; lane > 0; lane /= 2) {
@@ -1875,7 +1875,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
           }
           float dist = 0.0f;
           for (int j = tx; j < state->vector_dim; j += warpSize) {
-            const float diff = state->vector_data[cand * state->vector_dim + j] - query_vec[j];
+            const float diff = state->vector_data[static_cast<size_t>(cand) * state->vector_dim + j] - query_vec[j];
             dist += diff * diff;
           }
           for (int lane = warpSize / 2; lane > 0; lane /= 2) {
