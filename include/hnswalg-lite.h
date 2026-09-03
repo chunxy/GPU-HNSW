@@ -250,8 +250,6 @@ class HierarchicalNswLite {
     cuda_free_buffer(host_gpu_graph_state_.search_block_clear_cycles);
     cuda_free_buffer(host_gpu_graph_state_.search_block_expands);
 #endif
-    cuda_free_buffer(host_gpu_graph_state_.precomputed_new_new_dist);
-    cuda_free_buffer(host_gpu_graph_state_.precomputed_new_new_rank);
     cuda_free_buffer(host_gpu_graph_state_.news_dist);
     cuda_free_buffer(host_gpu_graph_state_.news_rank);
     cuda_free_buffer(host_gpu_graph_state_.frozen_link_counts);
@@ -1069,19 +1067,16 @@ class HierarchicalNswLite {
     gpuMalloc(&host_gpu_graph_state_.changed_old_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL);
     gpuMemset(host_gpu_graph_state_.changed_old_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL);
 
-    const size_t old_new_distances_count = (BATCHSZ_PER_NEW) * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
-    gpuMalloc(&host_gpu_graph_state_.news_dist, sizeof(float) * old_new_distances_count);
-    gpuMalloc(&host_gpu_graph_state_.news_rank, sizeof(uint32_t) * old_new_distances_count);
-
-    const size_t num_new_new_batches = (gpu_max_elements + BATCHSZ_PER_NEW - 1) / BATCHSZ_PER_NEW;
-    const size_t precomputed_new_new_count = num_new_new_batches * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
-    gpuMalloc(&host_gpu_graph_state_.precomputed_new_new_dist, sizeof(float) * precomputed_new_new_count);
-    gpuMalloc(&host_gpu_graph_state_.precomputed_new_new_rank, sizeof(uint32_t) * precomputed_new_new_count);
+    // Reused each batch: old-new in [0, LEVEL_SZ_THRES), new-new in [LEVEL_SZ_THRES, LEVEL_SZ_THRES + BATCHSZ_PER_NEW).
+    const size_t news_distances_count = (BATCHSZ_PER_NEW) * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
+    gpuMalloc(&host_gpu_graph_state_.news_dist, sizeof(float) * news_distances_count);
+    gpuMalloc(&host_gpu_graph_state_.news_rank, sizeof(uint32_t) * news_distances_count);
 
 #ifdef PROFILE_BUILD_PHASES
     gpuMalloc(&host_gpu_graph_state_.build_phase_cycles, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount));
     gpuMemset(host_gpu_graph_state_.build_phase_cycles, 0, sizeof(uint64_t) * static_cast<size_t>(kBuildPhaseCount));
-    const size_t search_block_profile_count = num_new_new_batches * static_cast<size_t>(GRID_DIM);
+    const size_t num_build_batches = (gpu_max_elements + BATCHSZ_PER_NEW - 1) / BATCHSZ_PER_NEW;
+    const size_t search_block_profile_count = num_build_batches * static_cast<size_t>(GRID_DIM);
     gpuMalloc(&host_gpu_graph_state_.search_block_cycles, sizeof(uint64_t) * search_block_profile_count);
     gpuMemset(host_gpu_graph_state_.search_block_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
     gpuMalloc(&host_gpu_graph_state_.search_block_clear_cycles, sizeof(uint64_t) * search_block_profile_count);
@@ -1231,7 +1226,6 @@ class HierarchicalNswLite {
     // compute the powers, generate the random levels, and convert to half precision
     CUDA_CHECK(cudaEventRecord(ev_prepare_start));
     CUDA_CHECK(launch_prepare_graph_kernel(device_gpu_graph_state_));
-    CUDA_CHECK(launch_precompute_new_new_dist_kernel(device_gpu_graph_state_, host_gpu_graph_state_.max_elements));
     CUDA_CHECK(cudaEventRecord(ev_prepare_end));
     CUDA_CHECK(cudaEventSynchronize(ev_prepare_end));
     float ms_prepare = 0.0f;

@@ -503,36 +503,33 @@ __device__ void compute_dist_block_wmma(
   __syncthreads();
 }
 
-__device__ void compute_new_new_dist_into_buffers(
-    GpuGraphState *state,
-    uint32_t batch_base,
-    uint32_t new_count,
-    float *dist_out,
-    uint32_t dist_row_stride,
-    uint32_t *rank_out,
-    uint32_t rank_row_stride) {
+// Grid-wide A*A^T of the current new batch into news_dist columns [LEVEL_SZ_THRES, ...).
+// Each warp owns its 16x16 tiles end-to-end (MMA + L2 epilogue), so no grid barrier is required.
+__device__ void compute_new_new_dist_kernel(GpuGraphState *state) {
+  const uint32_t batch_base = state->cur_element_count;
+  const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - batch_base);
   if (new_count == 0) return;
 
-  half *new_vector_store = state->half_vector_data + static_cast<size_t>(batch_base) * state->vector_dim;
+  const half *new_vector_store = state->half_vector_data + static_cast<size_t>(batch_base) * state->vector_dim;
+  constexpr int kStride = LEVEL_SZ_THRES + BATCHSZ_PER_NEW;
+  constexpr int kColOff = LEVEL_SZ_THRES;
 
-  // compute new-new inner products using tensor core
-  {
     namespace wmma = nvcuda::wmma;
     constexpr int kWmmaM = 16;
     constexpr int kWmmaN = 16;
     constexpr int kWmmaK = 16;
-    const int warp_count = blockDim.x / warpSize;
+  const int warps_per_block = blockDim.x / warpSize;
     const int warp_id = threadIdx.x / warpSize;
+  const int global_warp = blockIdx.x * warps_per_block + warp_id;
+  const int total_warps = gridDim.x * warps_per_block;
     const int tile_cols = new_count / kWmmaN;
     const int tile_rows = new_count / kWmmaM;
     const int tile_count = tile_rows * tile_cols;
+  __shared__ float ip_tile[BLOCK_DIM / 32][kWmmaM * kWmmaN];
 
-    if (warp_id < warp_count) {
-      for (int tile_idx = warp_id; tile_idx < tile_count; tile_idx += warp_count) {
-        const int tile_row = tile_idx / tile_cols;
-        const int tile_col = tile_idx % tile_cols;
-        const int new_row = tile_row * kWmmaM;
-        const int new_col = tile_col * kWmmaN;
+  for (int tile_idx = global_warp; tile_idx < tile_count; tile_idx += total_warps) {
+    const int new_row = (tile_idx / tile_cols) * kWmmaM;
+    const int new_col = (tile_idx % tile_cols) * kWmmaN;
 
         wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float> c_frag;
         wmma::fill_fragment(c_frag, 0.0f);
@@ -547,18 +544,29 @@ __device__ void compute_new_new_dist_into_buffers(
           wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
 
-        float *output_ptr = dist_out + new_row * dist_row_stride + new_col;
-        wmma::store_matrix_sync(output_ptr, c_frag, dist_row_stride, wmma::mem_row_major);
-      }
+    wmma::store_matrix_sync(&ip_tile[warp_id][0], c_frag, kWmmaN, wmma::mem_row_major);
+    __syncwarp();
+
+    const int lane = threadIdx.x % warpSize;
+    for (int e = lane; e < kWmmaM * kWmmaN; e += warpSize) {
+      const int ti = e / kWmmaN;
+      const int tj = e % kWmmaN;
+      const uint32_t one = batch_base + new_row + ti;
+      const uint32_t another = batch_base + new_col + tj;
+      const int out_idx = (new_row + ti) * kStride + kColOff + new_col + tj;
+      float ip = ip_tile[warp_id][e];
+      state->news_dist[out_idx] = -2 * ip + state->vector_powers[one] + state->vector_powers[another];
+      state->news_rank[out_idx] = another;
     }
   }
-  __syncthreads();
 
-  // handle tail rows/cols not covered by WMMA full tiles
+  if (new_count % 16 != 0) {
   const int wmma_rows = (new_count / 16) * 16;
   const int wmma_cols = (new_count / 16) * 16;
-  for (uint32_t i = 0; i < new_count; ++i) {
-    for (int j = threadIdx.x; j < new_count; j += blockDim.x) {
+    const int total = new_count * new_count;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += gridDim.x * blockDim.x) {
+      const int i = idx / new_count;
+      const int j = idx % new_count;
       if (i < wmma_rows && j < wmma_cols) continue;
       float ip = 0.0f;
       const int row_st = i * state->vector_dim;
@@ -566,62 +574,13 @@ __device__ void compute_new_new_dist_into_buffers(
       for (int k = 0; k < state->vector_dim; ++k) {
         ip += __half2float(new_vector_store[row_st + k]) * __half2float(new_vector_store[col_st + k]);
       }
-      dist_out[i * dist_row_stride + j] = ip;
-    }
-  }
-  __syncthreads();
-
-  for (uint32_t i = 0; i < new_count; ++i) {
+      const int out_idx = i * kStride + kColOff + j;
     const uint32_t one = batch_base + i;
-    for (int j = threadIdx.x; j < new_count; j += blockDim.x) {
-      const int out_idx = i * dist_row_stride + j;
-      float ip = dist_out[out_idx];
-      dist_out[out_idx] = -2 * ip + state->vector_powers[one];
       const uint32_t another = batch_base + j;
-      dist_out[out_idx] += state->vector_powers[another];
-      rank_out[i * rank_row_stride + j] = another;
+      state->news_dist[out_idx] = -2 * ip + state->vector_powers[one] + state->vector_powers[another];
+      state->news_rank[out_idx] = another;
     }
   }
-}
-
-__device__ void load_precomputed_new_new_dist(GpuGraphState *state) {
-  const uint32_t batch_id = state->cur_element_count / BATCHSZ_PER_NEW;
-  const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
-  if (new_count == 0) return;
-
-  const size_t batch_offset = batch_id * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
-  const float *src_dist = state->precomputed_new_new_dist + batch_offset;
-  const uint32_t *src_rank = state->precomputed_new_new_rank + batch_offset;
-  const int dst_row_stride = LEVEL_SZ_THRES + BATCHSZ_PER_NEW;
-  const int total = new_count * new_count;
-
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += gridDim.x * blockDim.x) {
-    const int i = idx / new_count;
-    const int j = idx % new_count;
-    const int dst = i * dst_row_stride + LEVEL_SZ_THRES + j;
-    const int src = i * BATCHSZ_PER_NEW + j;
-    state->news_dist[dst] = src_dist[src];
-    state->news_rank[dst] = src_rank[src];
-  }
-}
-
-__global__ void precompute_new_new_dist_kernel(GpuGraphState *state) {
-  const uint32_t batch_id = blockIdx.x;
-  const uint32_t batch_base = batch_id * BATCHSZ_PER_NEW;
-  if (batch_base >= state->max_elements) return;
-
-  const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - batch_base);
-  const size_t batch_offset = batch_id * BATCHSZ_PER_NEW * BATCHSZ_PER_NEW;
-  float *dist_out = state->precomputed_new_new_dist + batch_offset;
-  uint32_t *rank_out = state->precomputed_new_new_rank + batch_offset;
-  compute_new_new_dist_into_buffers(state, batch_base, new_count, dist_out, BATCHSZ_PER_NEW, rank_out, BATCHSZ_PER_NEW);
-}
-
-cudaError_t launch_precompute_new_new_dist_kernel(GpuGraphState *state, uint32_t max_elements) {
-  const uint32_t num_batches = (max_elements + BATCHSZ_PER_NEW - 1) / BATCHSZ_PER_NEW;
-  if (num_batches == 0) return cudaSuccess;
-  precompute_new_new_dist_kernel<<<num_batches, BLOCK_DIM>>>(state);
-  return cudaGetLastError();
 }
 
 #ifndef NDEBUG
@@ -1146,16 +1105,16 @@ __global__ void build_aggregate_on_level_kernel(GpuGraphState *state) {
   build_phase_record(state, kBuildPhaseAggregate, phase_t0);
 }
 
-__global__ void build_dist_old_new_and_load_new_new_kernel(GpuGraphState *state) {
+__global__ void build_dist_old_new_and_new_new_kernel(GpuGraphState *state) {
   uint64_t phase_t0 = build_phase_begin(state);
   // Compute the distances between the new vectors and the old vectors.
   compute_dist_with_old_kernel(state);
   build_phase_record(state, kBuildPhaseDistOldNew, phase_t0);
 
   phase_t0 = build_phase_begin(state);
-  // Load the precomputed distances between the new vectors for this batch.
-  load_precomputed_new_new_dist(state);
-  build_phase_record(state, kBuildPhaseLoadNewNew, phase_t0);
+  // Compute the distances among the new vectors for this batch into news_dist.
+  compute_new_new_dist_kernel(state);
+  build_phase_record(state, kBuildPhaseDistNewNew, phase_t0);
 }
 
 __global__ void build_sort_and_connect_upper_kernel(GpuGraphState *state) {
@@ -1244,8 +1203,8 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     if (const cudaError_t err = sync_kernel("build_reset_batch_state_kernel", i); err != cudaSuccess) return err;
     build_aggregate_on_level_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_aggregate_on_level_kernel", i); err != cudaSuccess) return err;
-    build_dist_old_new_and_load_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
-    if (const cudaError_t err = sync_kernel("build_dist_old_new_and_load_new_new_kernel", i); err != cudaSuccess)
+    build_dist_old_new_and_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_dist_old_new_and_new_new_kernel", i); err != cudaSuccess)
       return err;
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_sort_and_connect_upper_kernel", i); err != cudaSuccess) return err;

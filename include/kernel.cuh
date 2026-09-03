@@ -56,8 +56,6 @@ struct GpuGraphState {
   uint32_t old_vec_fetch_offset{0};
   uint32_t *level_counts{nullptr};
   float *vector_powers{nullptr};
-  float *precomputed_new_new_dist{nullptr};
-  uint32_t *precomputed_new_new_rank{nullptr};
   float *news_dist{nullptr};
   uint32_t *news_rank{nullptr};
   uint32_t *visited{nullptr};
@@ -83,8 +81,6 @@ __global__ void prepare_graph_kernel(GpuGraphState *state);
 
 cudaError_t launch_prepare_graph_kernel(GpuGraphState *state);
 
-cudaError_t launch_precompute_new_new_dist_kernel(GpuGraphState *state, uint32_t max_elements);
-
 cudaError_t launch_build_graph_kernel(GpuGraphState *state);
 
 __device__ void compute_power_kernel(GpuGraphState *state);
@@ -94,6 +90,8 @@ __device__ void generate_random_levels_kernel(GpuGraphState *state);
 __device__ void copy_float_to_half_kernel(GpuGraphState *state);
 
 __device__ void compute_dist_with_old_kernel(GpuGraphState *state);
+
+__device__ void compute_new_new_dist_kernel(GpuGraphState *state);
 
 __device__ void connect_for_new_kernel(GpuGraphState *state, int startup_level);
 

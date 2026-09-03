@@ -5,7 +5,7 @@
 enum BuildPhase : int {
   kBuildPhaseAggregate = 0,
   kBuildPhaseDistOldNew,
-  kBuildPhaseLoadNewNew,
+  kBuildPhaseDistNewNew,
   kBuildPhaseSortOldByDist,
   kBuildPhaseConnectUpper,
   kBuildPhaseSnapshotFrozen,
@@ -24,8 +24,8 @@ inline const char *build_phase_name(BuildPhase phase) {
       return "aggregate_on_level";
     case kBuildPhaseDistOldNew:
       return "dist_old_new";
-    case kBuildPhaseLoadNewNew:
-      return "load_new_new";
+    case kBuildPhaseDistNewNew:
+      return "dist_new_new";
     case kBuildPhaseSortOldByDist:
       return "sort_old_by_dist";
     case kBuildPhaseConnectUpper:
