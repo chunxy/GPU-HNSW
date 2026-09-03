@@ -829,7 +829,13 @@ __device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
         }
       }
 
-      // prune all the candidates
+      // Heuristic prune only the closest ef_construction (CPU HNSW does the
+      // same on the search hit list). The bitonic pass already ranked the
+      // full combined list, so the prefix is the nearest efc.
+      if (sz > state->ef_construction) {
+        sz = state->ef_construction;
+      }
+
 #ifndef NDEBUG
       debug_check_pruned_mask_range(sz, "combine_prune_for_new", vid, lv);
 #endif
