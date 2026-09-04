@@ -54,6 +54,7 @@ struct GpuGraphState {
   // is component d of old_vector_fetch_index[i]. Sized LEVEL_SZ_THRES * vector_dim.
   half *old_vector_store{nullptr};
   uint32_t old_vec_fetch_offset{0};
+  uint32_t *old_vector_level_delimiter{nullptr};
   uint32_t *level_counts{nullptr};
   float *vector_powers{nullptr};
   float *news_dist{nullptr};

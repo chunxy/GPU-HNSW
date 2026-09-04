@@ -359,6 +359,7 @@ __device__ void reset_batch_state_kernel(GpuGraphState *state) {
   }
   for (int level = blockIdx.x * blockDim.x + threadIdx.x; level < MAX_HNSW_LEVEL; level += gridDim.x * blockDim.x) {
     state->changed_old_link_counts[level] = 0;
+    state->old_vector_level_delimiter[level] = 0;
   }
 }
 
@@ -392,7 +393,10 @@ __device__ void aggregate_on_level_kernel(GpuGraphState *state, int lv) {
   __syncthreads();
 
   for (uint32_t j = threadIdx.x; j < block_match_count; j += blockDim.x) {
-    state->old_vector_fetch_index[block_write_base + j] = block_local_ids[j];
+    const uint32_t id = block_local_ids[j];
+    const uint32_t level = state->element_levels[id];
+    state->old_vector_fetch_index[block_write_base + j] = id;
+    atomicAdd(&state->old_vector_level_delimiter[level], 1);
   }
 }
 
@@ -1112,6 +1116,12 @@ __global__ void build_aggregate_on_level_kernel(GpuGraphState *state) {
   build_phase_record(state, kBuildPhaseAggregate, phase_t0);
 }
 
+__global__ void build_compute_level_delimiter_kernel(GpuGraphState *state) {
+  for (int level = 1; level < MAX_HNSW_LEVEL; ++level) {
+    state->old_vector_level_delimiter[level] += state->old_vector_level_delimiter[level - 1];
+  }
+}
+
 __global__ void build_dist_old_new_and_new_new_kernel(GpuGraphState *state) {
   uint64_t phase_t0 = build_phase_begin(state);
   // Compute the distances between the new vectors and the old vectors.
@@ -1210,6 +1220,7 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     if (const cudaError_t err = sync_kernel("build_reset_batch_state_kernel", i); err != cudaSuccess) return err;
     build_aggregate_on_level_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_aggregate_on_level_kernel", i); err != cudaSuccess) return err;
+    build_compute_level_delimiter_kernel<<<1, 1>>>(state);
     build_dist_old_new_and_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_dist_old_new_and_new_new_kernel", i); err != cudaSuccess) return err;
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);

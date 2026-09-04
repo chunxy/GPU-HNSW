@@ -255,7 +255,9 @@ class HierarchicalNswLite {
     cuda_free_buffer(host_gpu_graph_state_.frozen_link_counts);
     cuda_free_buffer(host_gpu_graph_state_.changed_old_links);
     cuda_free_buffer(host_gpu_graph_state_.changed_old_link_counts);
+    cuda_free_buffer(host_gpu_graph_state_.old_vector_fetch_index);
     cuda_free_buffer(host_gpu_graph_state_.old_vector_store);
+    cuda_free_buffer(host_gpu_graph_state_.old_vector_level_delimiter);
     cuda_free_buffer(host_gpu_graph_state_.visited_tags);
     cuda_free_buffer(device_gpu_graph_state_);
 
@@ -1052,6 +1054,7 @@ class HierarchicalNswLite {
     gpuMalloc(&host_gpu_graph_state_.half_vector_data, sizeof(half) * gpu_max_elements * gpu_vector_dim);
     gpuMalloc(&host_gpu_graph_state_.old_vector_fetch_index, sizeof(uint32_t) * LEVEL_SZ_THRES);
     gpuMalloc(&host_gpu_graph_state_.old_vector_store, sizeof(half) * LEVEL_SZ_THRES * gpu_vector_dim);
+    gpuMalloc(&host_gpu_graph_state_.old_vector_level_delimiter, sizeof(uint32_t) * MAX_HNSW_LEVEL);
     gpuMalloc(&host_gpu_graph_state_.link_lists, sizeof(char *) * gpu_max_elements);
     gpuMemset(host_gpu_graph_state_.link_lists, 0, sizeof(char *) * gpu_max_elements);
     gpuMalloc(&host_gpu_graph_state_.visited, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
