@@ -1211,8 +1211,7 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     build_aggregate_on_level_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_aggregate_on_level_kernel", i); err != cudaSuccess) return err;
     build_dist_old_new_and_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
-    if (const cudaError_t err = sync_kernel("build_dist_old_new_and_new_new_kernel", i); err != cudaSuccess)
-      return err;
+    if (const cudaError_t err = sync_kernel("build_dist_old_new_and_new_new_kernel", i); err != cudaSuccess) return err;
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_sort_and_connect_upper_kernel", i); err != cudaSuccess) return err;
     build_snapshot_frozen_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
@@ -1982,8 +1981,8 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
 }
 
 #ifdef PROFILE_BUILD_PHASES
-#include <algorithm>
 #include <fmt/format.h>
+#include <algorithm>
 #include <vector>
 
 void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count) {
@@ -2034,8 +2033,7 @@ double percentile_sorted(const std::vector<double> &sorted, double p) {
   return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
 }
 
-void summarize_batch_imbalance(
-    const uint64_t *values, uint64_t batch_begin, uint64_t batch_end, const char *label) {
+void summarize_batch_imbalance(const uint64_t *values, uint64_t batch_begin, uint64_t batch_end, const char *label) {
   std::vector<double> ratios;
   ratios.reserve(static_cast<size_t>(batch_end - batch_begin));
   double sum_idle = 0.0;
