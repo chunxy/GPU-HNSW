@@ -356,6 +356,7 @@ __device__ void copy_float_to_half_kernel(GpuGraphState *state) {
 __device__ void reset_batch_state_kernel(GpuGraphState *state) {
   if (blockIdx.x * blockDim.x + threadIdx.x == 0) {
     state->old_vec_fetch_offset = 0;
+    state->next_bid = 0;
   }
   for (int level = blockIdx.x * blockDim.x + threadIdx.x; level < MAX_HNSW_LEVEL; level += gridDim.x * blockDim.x) {
     state->changed_old_link_counts[level] = 0;
@@ -1602,8 +1603,8 @@ debug_search_lower_check_cand(GpuGraphState *state, uint32_t cand, uint32_t from
 }
 #endif  // NDEBUG
 
-// 1 block for 1 new vector
-// threads for distance computation
+// Worker blocks claim new vectors from search_next_bid.
+// Threads in a block compute distances for the claimed vector.
 __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int startup_lv) {
   __shared__ uint32_t *visited;
   __shared__ uint32_t visited_tag;
@@ -1620,6 +1621,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
   __shared__ float warp_best_dist[SEARCH_WARP_COUNT];
   __shared__ uint32_t warp_best_cand[SEARCH_WARP_COUNT];
   __shared__ Neighbor popped;
+  __shared__ int claimed;
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
 #ifndef NDEBUG
   if (threadIdx.x == 0) {
@@ -1654,7 +1656,21 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
   uint64_t t_mark = 0;
   if (state->profile_build_phases && threadIdx.x == 0) t_mark = clock64();
 #endif
-  for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
+  int steal_phase = 0;
+  while (true) {
+    if (threadIdx.x == 0) {
+      if (steal_phase == 0) {
+        claimed = blockIdx.x;
+      } else {
+        claimed = GRID_DIM + atomicAdd(&state->next_bid, 1U);
+      }
+    }
+    __syncthreads();
+    const int bid = claimed;
+    if (bid >= new_count) {
+      break;
+    }
+    steal_phase = 1;
     const int vid = state->cur_element_count + bid;
 #ifndef NDEBUG
     if (vid < 0 || static_cast<uint32_t>(vid) >= state->max_elements) {

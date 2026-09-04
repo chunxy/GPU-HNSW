@@ -66,6 +66,9 @@ struct GpuGraphState {
   uint32_t *frozen_link_counts{nullptr};
   uint32_t *changed_old_links{nullptr};
   uint32_t *changed_old_link_counts{nullptr};
+  // Steal counter for search_knn_at_lower leftovers. Reset each batch.
+  // Block b first processes bid b, then atomicAdd here for bids GRID_DIM, GRID_DIM+1, ...
+  uint32_t next_bid{0};
 
 #ifdef PROFILE_BUILD_PHASES
   bool profile_build_phases{false};
