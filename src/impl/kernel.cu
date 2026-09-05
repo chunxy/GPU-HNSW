@@ -730,222 +730,243 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
 #endif
         datal[pos] = cand;
         distl[pos] = ranked_dist[neigh_rank[i]];
-        if (cand >= state->cur_element_count) continue;
-        uint32_t *other_linkl = get_level_linklist(state, cand, lv);
-        auto other_datal = (uint32_t *)(other_linkl) + 1;
-        float *other_distl = get_level_linklist_dist(state, cand, lv);
-        int other_pos = atomicAdd((uint32_t *)other_linkl, 1);
-        record_changed_old_link(state, cand, lv);
-#ifndef NDEBUG
-        if (other_pos >= capacity) {
-          printf("Fatal: reverse link list out of bound at level %d for node %u\n", lv, cand);
-          assert(false);
-        }
-#endif
-        other_datal[other_pos] = vid;
-        other_distl[other_pos] = ranked_dist[neigh_rank[i]];
       }
       // __syncthreads();
     }
   }
 }
 
-// 1 block for 1 new vector
-__device__ void combine_prune_for_new_kernel(GpuGraphState *state) {
+// Merge in_ids/in_dists with the new-new panel in news_*[LEVEL_SZ_THRES..] and
+// publish <= M neighbors into the new vector's link list at lv.
+// ranked_cand/ranked_dist are the news_* prefix for this new vector.
+// Callers own the shared scratch and must be one block per new vector.
+__device__ void combine_prune_one_level(
+    GpuGraphState *state,
+    int vid,
+    int lv,
+    uint32_t *ranked_cand,
+    float *ranked_dist,
+    const uint32_t *in_ids,
+    const float *in_dists,
+    uint32_t in_sz,
+    uint32_t *shared_sz,
+    uint32_t *prev_neigh_rank,
+    uint32_t *prev_neigh_id,
+    volatile uint32_t *curr_neigh_cnt,
+    uint32_t *neigh_rank,
+    unsigned char *pruned_mask,
+    bool *can_continue) {
+  const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
+  uint32_t *linkl = get_level_linklist(state, vid, lv);
+  uint32_t *datal = (uint32_t *)(linkl + 1);
+  float *distl = get_level_linklist_dist(state, vid, lv);
+  if (threadIdx.x == 0) {
+    *shared_sz = in_sz;
+  }
+  for (int i = threadIdx.x; i < static_cast<int>(in_sz); i += blockDim.x) {
+    ranked_dist[i] = in_dists[i];
+    ranked_cand[i] = in_ids[i];
+  }
+  __syncthreads();
+  static_assert(LEVEL_SZ_THRES - MAX_M0 >= BATCHSZ_PER_NEW);  // Avoid overwriting when moving data.
+  for (int i = threadIdx.x; i < new_count; i += blockDim.x) {
+    if (state->element_levels[state->cur_element_count + i] >= lv) {
+      uint32_t pos = atomicAdd(shared_sz, 1);
+      ranked_dist[pos] = ranked_dist[i + LEVEL_SZ_THRES];
+      ranked_cand[pos] = ranked_cand[i + LEVEL_SZ_THRES];
+    }
+  }
+  __syncthreads();
+  uint32_t sz = *shared_sz;
+
+  int M = lv ? state->M : state->maxM0;
+  // No heuristic prune needed. Still drop the self-edge and publish count
+  // only after neighbor ids are written. Do not assume ranked_cand[0] is
+  // self: this path has not sorted, and ranked_cand[sz] is unfilled.
+  if (sz < static_cast<uint32_t>(M) + 1) {
+    if (threadIdx.x == 0) {
+      uint32_t out = 0;
+      for (uint32_t i = 0; i < sz; ++i) {
+        const uint32_t cand = ranked_cand[i];
+        if (cand == static_cast<uint32_t>(vid)) {
+          continue;
+        }
+        datal[out] = cand;
+        distl[out] = ranked_dist[i];
+        ++out;
+      }
+      setListCount(linkl, out);
+    }
+    __syncthreads();
+    return;
+  }
+
+  // sort the combined neighbors by distance
+  int sortlen = next_power_of_two(sz);
+  const unsigned tid = threadIdx.x;
+  for (unsigned stride = 1; stride < sortlen; stride <<= 1) {
+    for (unsigned step = stride; step > 0; step >>= 1) {
+      for (unsigned k = tid; k < sortlen / 2; k += blockDim.x) {
+        unsigned a = 2 * step * (k / step);
+        unsigned b = k % step;
+        unsigned u = ((step == stride) ? (a + step - 1 - b) : (a + b));
+        unsigned d = a + b + step;
+        if (d < sz && ranked_dist[u] > ranked_dist[d]) {
+          swap(ranked_dist[u], ranked_dist[d]);
+          swap(ranked_cand[u], ranked_cand[d]);
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  // Heuristic prune only the closest ef_construction (CPU HNSW does the
+  // same on the search hit list). The bitonic pass already ranked the
+  // full combined list, so the prefix is the nearest efc.
+  if (sz > state->ef_construction) {
+    sz = state->ef_construction;
+  }
+
+#ifndef NDEBUG
+  debug_check_pruned_mask_range(sz, "combine_prune_one_level", vid, lv);
+#endif
+  for (int i = threadIdx.x; i < sz; i += blockDim.x) {
+    pruned_mask[i] = (ranked_cand[i] == vid) ? 1 : 0;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    *curr_neigh_cnt = 0;
+    for (int i = 0; i < sz; i++) {
+      if (pruned_mask[i] == 0) {
+        *prev_neigh_rank = i;
+        *prev_neigh_id = ranked_cand[i];
+        neigh_rank[0] = *prev_neigh_rank;
+        *curr_neigh_cnt = 1;
+        pruned_mask[i] = 1;
+        break;
+      }
+    }
+  }
+  __syncthreads();
+  if (*curr_neigh_cnt == 0) {
+    if (threadIdx.x == 0) {
+      setListCount(linkl, 0);
+    }
+    __syncthreads();
+    return;
+  }
+
+  while (*curr_neigh_cnt < M) {
+    // Start to treat the block as 2d, x for dimensions, y for candidates
+    int tx = threadIdx.x % warpSize;  // compute distance along this dimension
+    int ty = threadIdx.x / warpSize;  // compute for different candidates
+    int nrow = blockDim.x / warpSize;
+
+    if (threadIdx.x == 0) {
+      *can_continue = 0;
+    }
+    __syncthreads();
+    const float *prev_vec = state->vector_data + static_cast<size_t>(*prev_neigh_id) * state->vector_dim;
+    for (int i = ty; i < sz; i += nrow) {
+      if (i <= *prev_neigh_rank) continue;
+      if (pruned_mask[i] == 0) {
+        *can_continue = 1;
+        float dist = 0.0f;
+        int cand = ranked_cand[i];
+        const float *cand_vec = state->vector_data + static_cast<size_t>(cand) * state->vector_dim;
+        for (int j = tx; j < state->vector_dim; j += warpSize) {
+          float diff = cand_vec[j] - prev_vec[j];
+          dist += diff * diff;
+        }
+        for (int lane = warpSize / 2; lane > 0; lane /= 2) {
+          dist += __shfl_down_sync(0xffffffff, dist, lane);
+        }
+        if (tx == 0 && dist < ranked_dist[i]) {
+          pruned_mask[i] = 1;
+        }
+      }
+    }
+    __syncthreads();
+    if (!*can_continue) {
+      break;
+    }
+    // Re-treat as 1d, adding the first survived edge.
+    if (threadIdx.x == 0) {
+      for (int i = *prev_neigh_rank + 1; i < sz; i++) {
+        if (pruned_mask[i] == 0) {
+          *prev_neigh_rank = i;
+          *prev_neigh_id = ranked_cand[i];
+          neigh_rank[*curr_neigh_cnt] = i;
+          (*curr_neigh_cnt)++;
+          pruned_mask[i] = 1;
+          break;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // Still treat as 1d block, adding all the selected edges based on the result.
+  if (threadIdx.x == 0) {
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < *curr_neigh_cnt; ++i) {
+      const uint32_t cand = ranked_cand[neigh_rank[i]];
+      if (cand == static_cast<uint32_t>(vid) || cand >= state->max_elements ||
+          state->element_levels[cand] < static_cast<uint32_t>(lv)) {
+        continue;
+      }
+      datal[out] = cand;
+      distl[out] = ranked_dist[neigh_rank[i]];
+      ++out;
+    }
+    setListCount(linkl, out);
+  }
+  __syncthreads();
+}
+
+// 1 block for 1 new vector. Lower levels are already pruned in search.
+__device__ void combine_prune_for_new_kernel(GpuGraphState *state, int startup_level) {
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
   __shared__ volatile uint32_t curr_neigh_cnt;
-  __shared__ uint32_t neigh_rank[BATCHSZ_PER_NEW];
-  __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
+  __shared__ uint32_t neigh_rank[MAX_M0];
+  __shared__ unsigned char pruned_mask[TOPQ_SZ + BATCHSZ_PER_NEW];
   __shared__ bool can_continue;
   __shared__ uint32_t shared_sz;
-  // connect new-to-old and new-to-new edges from startup level
   int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
     auto ranked_cand = state->news_rank + (bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW));
     auto ranked_dist = state->news_dist + (bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW));
 
-    for (int lv = 0; lv <= state->element_levels[vid]; ++lv) {
-      // combine old neighbors and new vectors
+    for (int lv = startup_level; lv <= state->element_levels[vid]; ++lv) {
       uint32_t *linkl = get_level_linklist(state, vid, lv);
-      uint32_t sz = getListCount(linkl);
+      const uint32_t sz = getListCount(linkl);
       uint32_t *datal = (uint32_t *)(linkl + 1);
       float *distl = get_level_linklist_dist(state, vid, lv);
-      if (threadIdx.x == 0) {
-        shared_sz = sz;
-      }
-      for (int i = threadIdx.x; i < sz; i += blockDim.x) {
-        int other = datal[i];
-        float dist = distl[i];
-        ranked_dist[i] = dist;
-        ranked_cand[i] = other;
-      }
-      __syncthreads();
-      static_assert(LEVEL_SZ_THRES - MAX_M0 >= BATCHSZ_PER_NEW);  // Avoid overwriting when moving data.
-      for (int i = threadIdx.x; i < new_count; i += blockDim.x) {
-        if (state->element_levels[state->cur_element_count + i] >= lv) {
-          uint32_t pos = atomicAdd(&shared_sz, 1);
-          ranked_dist[pos] = ranked_dist[i + LEVEL_SZ_THRES];
-          ranked_cand[pos] = ranked_cand[i + LEVEL_SZ_THRES];
-        }
-      }
-      __syncthreads();
-      sz = shared_sz;
-
-      int M = lv ? state->M : state->maxM0;
-      // No heuristic prune needed. Still drop the self-edge and publish count
-      // only after neighbor ids are written. Do not assume ranked_cand[0] is
-      // self: this path has not sorted, and ranked_cand[sz] is unfilled.
-      if (sz < static_cast<uint32_t>(M) + 1) {
-        if (threadIdx.x == 0) {
-          uint32_t out = 0;
-          for (uint32_t i = 0; i < sz; ++i) {
-            const uint32_t cand = ranked_cand[i];
-            if (cand == static_cast<uint32_t>(vid)) {
-              continue;
-            }
-            datal[out] = cand;
-            distl[out] = ranked_dist[i];
-            ++out;
-          }
-          setListCount(linkl, out);
-        }
-        __syncthreads();
-        continue;
-      }
-
-      // sort the combined neighbors by distance
-      int sortlen = next_power_of_two(sz);
-      const unsigned tid = threadIdx.x;
-      for (unsigned stride = 1; stride < sortlen; stride <<= 1) {
-        for (unsigned step = stride; step > 0; step >>= 1) {
-          for (unsigned k = tid; k < sortlen / 2; k += blockDim.x) {
-            unsigned a = 2 * step * (k / step);
-            unsigned b = k % step;
-            unsigned u = ((step == stride) ? (a + step - 1 - b) : (a + b));
-            unsigned d = a + b + step;
-            if (d < sz && ranked_dist[u] > ranked_dist[d]) {
-              swap(ranked_dist[u], ranked_dist[d]);
-              swap(ranked_cand[u], ranked_cand[d]);
-            }
-          }
-          __syncthreads();
-        }
-      }
-
-      // Heuristic prune only the closest ef_construction (CPU HNSW does the
-      // same on the search hit list). The bitonic pass already ranked the
-      // full combined list, so the prefix is the nearest efc.
-      if (sz > state->ef_construction) {
-        sz = state->ef_construction;
-      }
-
-#ifndef NDEBUG
-      debug_check_pruned_mask_range(sz, "combine_prune_for_new", vid, lv);
-#endif
-      for (int i = threadIdx.x; i < sz; i += blockDim.x) {
-        pruned_mask[i] = (ranked_cand[i] == vid) ? 1 : 0;
-      }
-      __syncthreads();
-
-      if (threadIdx.x == 0) {
-        curr_neigh_cnt = 0;
-        for (int i = 0; i < sz; i++) {
-          if (pruned_mask[i] == 0) {
-            prev_neigh_rank = i;
-            prev_neigh_id = ranked_cand[i];
-            neigh_rank[0] = prev_neigh_rank;
-            curr_neigh_cnt = 1;
-            pruned_mask[i] = 1;
-            break;
-          }
-        }
-      }
-      __syncthreads();
-      if (curr_neigh_cnt == 0) {
-        if (threadIdx.x == 0) {
-          setListCount(linkl, 0);
-        }
-        __syncthreads();
-        continue;
-      }
-
-      while (curr_neigh_cnt < M) {
-        // Start to treat the block as 2d, x for dimensions, y for candidates
-        int tx = threadIdx.x % warpSize;  // compute distance along this dimension
-        int ty = threadIdx.x / warpSize;  // compute for different candidates
-        int nrow = blockDim.x / warpSize;
-
-        if (threadIdx.x == 0) {
-          can_continue = 0;
-        }
-        __syncthreads();
-        const float *prev_vec = state->vector_data + static_cast<size_t>(prev_neigh_id) * state->vector_dim;
-        for (int i = ty; i < sz; i += nrow) {
-          if (i <= prev_neigh_rank) continue;
-          if (pruned_mask[i] == 0) {
-            can_continue = 1;
-            float dist = 0.0f;
-            int cand = ranked_cand[i];
-            const float *cand_vec = state->vector_data + static_cast<size_t>(cand) * state->vector_dim;
-            for (int j = tx; j < state->vector_dim; j += warpSize) {
-              float diff = cand_vec[j] - prev_vec[j];
-              dist += diff * diff;
-            }
-            for (int lane = warpSize / 2; lane > 0; lane /= 2) {
-              dist += __shfl_down_sync(0xffffffff, dist, lane);
-            }
-            if (tx == 0 && dist < ranked_dist[i]) {
-              pruned_mask[i] = 1;
-            }
-          }
-        }
-        __syncthreads();
-        if (!can_continue) {
-          break;
-        }
-        // Re-treat as 1d, adding the first survived edge.
-        if (threadIdx.x == 0) {
-          for (int i = prev_neigh_rank + 1; i < sz; i++) {
-            if (pruned_mask[i] == 0) {
-              prev_neigh_rank = i;
-              prev_neigh_id = ranked_cand[i];
-              neigh_rank[curr_neigh_cnt] = i;
-              curr_neigh_cnt++;
-              pruned_mask[i] = 1;
-              break;
-            }
-          }
-        }
-        __syncthreads();
-      }
-
-      // Still treat as 1d block, adding all the selected edges based on the result.
-      if (threadIdx.x == 0) {
-        uint32_t out = 0;
-        for (uint32_t i = 0; i < curr_neigh_cnt; ++i) {
-          const uint32_t cand = ranked_cand[neigh_rank[i]];
-          if (cand == static_cast<uint32_t>(vid) || cand >= state->max_elements ||
-              state->element_levels[cand] < static_cast<uint32_t>(lv)) {
-            continue;
-          }
-          datal[out] = cand;
-          distl[out] = ranked_dist[neigh_rank[i]];
-          ++out;
-        }
-        setListCount(linkl, out);
-      }
-      __syncthreads();
+      combine_prune_one_level(
+          state,
+          vid,
+          lv,
+          ranked_cand,
+          ranked_dist,
+          datal,
+          distl,
+          sz,
+          &shared_sz,
+          &prev_neigh_rank,
+          &prev_neigh_id,
+          &curr_neigh_cnt,
+          neigh_rank,
+          pruned_mask,
+          &can_continue);
     }
   }
 }
 
-// 1 block per new vector; reverse edges for levels below startup_level (deferred from search).
-__device__ void add_reverse_edges_at_lower_kernel(GpuGraphState *state, int startup_level) {
-  if (startup_level <= 0) {
-    return;
-  }
+// 1 block per new vector; reverse edges for every level after combine-prune.
+__device__ void add_reverse_edges_kernel(GpuGraphState *state) {
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
   for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
     const int vid = state->cur_element_count + bid;
@@ -961,7 +982,7 @@ __device__ void add_reverse_edges_at_lower_kernel(GpuGraphState *state, int star
       continue;
     }
 #endif
-    const int max_lv = min(startup_level - 1, static_cast<int>(state->element_levels[vid]));
+    const int max_lv = static_cast<int>(state->element_levels[vid]);
     for (int lv = 0; lv <= max_lv; ++lv) {
 #ifndef NDEBUG
       const uint32_t capacity = link_capacity_at_level(state, lv);
@@ -1165,14 +1186,14 @@ __global__ void build_search_knn_lower_kernel(GpuGraphState *state) {
 }
 
 __global__ void build_combine_prune_new_kernel(GpuGraphState *state) {
+  const int startup_level = compute_startup_level(state);
   uint64_t phase_t0 = build_phase_begin(state);
-  combine_prune_for_new_kernel(state);
+  combine_prune_for_new_kernel(state, startup_level);
   build_phase_record(state, kBuildPhaseCombinePruneNew, phase_t0);
 }
 
-__global__ void build_add_reverse_lower_kernel(GpuGraphState *state) {
-  const int startup_level = compute_startup_level(state);
-  add_reverse_edges_at_lower_kernel(state, startup_level);
+__global__ void build_add_reverse_kernel(GpuGraphState *state) {
+  add_reverse_edges_kernel(state);
 }
 
 __global__ void build_sort_prune_old_kernel(GpuGraphState *state) {
@@ -1232,8 +1253,8 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     if (const cudaError_t err = sync_kernel("build_search_knn_lower_kernel", i); err != cudaSuccess) return err;
     build_combine_prune_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_combine_prune_new_kernel", i); err != cudaSuccess) return err;
-    build_add_reverse_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
-    if (const cudaError_t err = sync_kernel("build_add_reverse_lower_kernel", i); err != cudaSuccess) return err;
+    build_add_reverse_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_add_reverse_kernel", i); err != cudaSuccess) return err;
     build_sort_prune_old_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_sort_prune_old_kernel", i); err != cudaSuccess) return err;
     build_update_batch_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
@@ -1622,6 +1643,13 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
   __shared__ uint32_t warp_best_cand[SEARCH_WARP_COUNT];
   __shared__ Neighbor popped;
   __shared__ int claimed;
+  __shared__ uint32_t prune_prev_neigh_rank;
+  __shared__ uint32_t prune_prev_neigh_id;
+  __shared__ volatile uint32_t prune_curr_neigh_cnt;
+  __shared__ uint32_t prune_neigh_rank[MAX_M0];
+  __shared__ unsigned char prune_mask[TOPQ_SZ + BATCHSZ_PER_NEW];
+  __shared__ bool prune_can_continue;
+  __shared__ uint32_t prune_shared_sz;
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
 #ifndef NDEBUG
   if (threadIdx.x == 0) {
@@ -1947,22 +1975,6 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
 #ifndef NDEBUG
       debug_search_lower_check_node_level(state, static_cast<uint32_t>(vid), lv, vid, "writeback new");
 #endif
-      uint32_t *linkl = get_level_linklist(state, vid, lv);
-      uint32_t *datal = (uint32_t *)(linkl + 1);
-      float *distl = get_level_linklist_dist(state, vid, lv);
-      const int write_sz = min(topq_sz, TOPQ_SZ);
-#ifndef NDEBUG
-      debug_search_lower_check_list(
-          state, static_cast<uint32_t>(vid), lv, static_cast<uint32_t>(write_sz), linkl, vid, "writeback new");
-      if (distl == nullptr) {
-        printf("Fatal: search_knn_at_lower: writeback null distl for new %d at level %d\n", vid, lv);
-        assert(false);
-      }
-#endif
-      for (int i = threadIdx.x; i < write_sz; i += blockDim.x) {
-        datal[i] = topq[i].nodeid;
-        distl[i] = topq[i].distance;
-      }
       // Next-level entry is the closest node in the result set (topq), not the
       // leftover candidate heap (which can be empty after a full expand).
       if (topq_sz > 0) {
@@ -1972,8 +1984,49 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
         curr_obj = entry_id;
         curr_dist = entry_dist;
       }
+      auto ranked_cand = state->news_rank + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
+      auto ranked_dist = state->news_dist + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
+      const int write_sz = min(topq_sz, TOPQ_SZ);
+      for (int i = threadIdx.x; i < write_sz; i += blockDim.x) {
+        ranked_cand[i] = topq[i].nodeid;
+        ranked_dist[i] = topq[i].distance;
+      }
+      __syncthreads();
+      combine_prune_one_level(
+          state,
+          vid,
+          lv,
+          ranked_cand,
+          ranked_dist,
+          ranked_cand,
+          ranked_dist,
+          static_cast<uint32_t>(write_sz),
+          &prune_shared_sz,
+          &prune_prev_neigh_rank,
+          &prune_prev_neigh_id,
+          &prune_curr_neigh_cnt,
+          prune_neigh_rank,
+          prune_mask,
+          &prune_can_continue);
+#ifndef NDEBUG
+      {
+        uint32_t *linkl = get_level_linklist(state, vid, lv);
+        const uint32_t published = getListCount(linkl);
+        const uint32_t M = lv ? state->M : state->maxM0;
+        if (published > M) {
+          printf(
+              "Fatal: search_knn_at_lower: published count %u > M %u "
+              "(vid=%d lv=%d topq_sz=%d)\n",
+              published,
+              M,
+              vid,
+              lv,
+              topq_sz);
+          assert(false);
+        }
+      }
+#endif
       if (threadIdx.x == 0) {
-        setListCount(linkl, write_sz);
         curr_obj_shared = curr_obj;
         curr_dist_bits_shared = __float_as_int(curr_dist);
 #ifndef NDEBUG
