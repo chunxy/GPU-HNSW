@@ -1019,9 +1019,9 @@ class HierarchicalNswLite {
     }
 
     const uint32_t gpu_size_links_level0 =
-        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (maxM0_ + BATCHSZ_PER_NEW) * 2);
+        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (maxM0_ + REVERSE_HEADROOM) * 2);
     const uint32_t gpu_size_links_per_element =
-        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (M_ + BATCHSZ_PER_NEW) * 2);
+        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (M_ + REVERSE_HEADROOM) * 2);
 
     host_gpu_graph_state_.max_elements = gpu_max_elements;
     host_gpu_graph_state_.cur_element_count = checked_u32(cur_element_count.load());
@@ -1149,7 +1149,7 @@ class HierarchicalNswLite {
         return;
       }
 
-      // GPU layout is: count, id with capacity including batch scratch, then distances.
+      // GPU layout is: count, ids with reverse-edge headroom, then distances.
       // CPU layout is: count, ids. Copy the ids explicitly and skip GPU distances.
       tableint *cpu_ids = reinterpret_cast<tableint *>(static_cast<linklistsizeint *>(cpu_ll) + 1);
       CUDA_CHECK(

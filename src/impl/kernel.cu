@@ -80,7 +80,7 @@ __device__ uint32_t *get_linklist(GpuGraphState *state, uint32_t internal_id, in
 
 __device__ float *get_linklist_dist(GpuGraphState *state, uint32_t internal_id, int level) {
   return (float *)(state->link_lists[internal_id] + (level - 1) * state->size_links_per_element +
-                   sizeof(linklistsizeint) + (state->M + BATCHSZ_PER_NEW) * sizeof(uint32_t));
+                   sizeof(linklistsizeint) + (state->M + REVERSE_HEADROOM) * sizeof(uint32_t));
 }
 
 __device__ char *level0_link_bytes(GpuGraphState *state, uint32_t internal_id) {
@@ -94,7 +94,7 @@ __device__ uint32_t *get_linklist0(GpuGraphState *state, uint32_t internal_id) {
 
 __device__ float *get_linklist_dist0(GpuGraphState *state, uint32_t internal_id) {
   return (float *)(level0_link_bytes(state, internal_id) + sizeof(linklistsizeint) +
-                   (state->maxM0 + BATCHSZ_PER_NEW) * sizeof(uint32_t));
+                   (state->maxM0 + REVERSE_HEADROOM) * sizeof(uint32_t));
 }
 
 __device__ uint32_t *get_level_linklist(GpuGraphState *state, uint32_t internal_id, int level) {
@@ -110,7 +110,7 @@ __device__ uint32_t getListCount(uint32_t *ptr) { return *((uint32_t *)ptr); }
 __device__ void setListCount(uint32_t *ptr, uint32_t size) { *((tableint *)ptr) = size; }
 
 __device__ uint32_t link_capacity_at_level(const GpuGraphState *state, int level) {
-  return level == 0 ? state->maxM0 + BATCHSZ_PER_NEW : state->M + BATCHSZ_PER_NEW;
+  return level == 0 ? state->maxM0 + REVERSE_HEADROOM : state->M + REVERSE_HEADROOM;
 }
 
 __device__ uint32_t frozen_link_count_offset(GpuGraphState *state, uint32_t internal_id, int level) {
@@ -1172,8 +1172,7 @@ __global__ void build_sort_and_connect_upper_kernel(GpuGraphState *state) {
 __global__ void build_snapshot_frozen_kernel(GpuGraphState *state) {
   const int startup_level = compute_startup_level(state);
   uint64_t phase_t0 = build_phase_begin(state);
-  // Freeze the link counts at lower levels (< startup_level)
-  // so that new vectors won't process the added reverse edges in current batch.
+  // Freeze the link counts used while searching lower levels.
   snapshot_frozen_link_counts_kernel(state, startup_level);
   build_phase_record(state, kBuildPhaseSnapshotFrozen, phase_t0);
 }
@@ -1182,18 +1181,20 @@ __global__ void build_search_knn_lower_kernel(GpuGraphState *state) {
   const int startup_level = compute_startup_level(state);
   uint64_t phase_t0 = build_phase_begin(state);
   search_knn_at_lower_kernel(state, startup_level);
-  build_phase_record(state, kBuildPhaseSearchLower, phase_t0);
+  build_phase_record(state, kBuildPhaseSearchPruneLower, phase_t0);
 }
 
 __global__ void build_combine_prune_new_kernel(GpuGraphState *state) {
   const int startup_level = compute_startup_level(state);
   uint64_t phase_t0 = build_phase_begin(state);
   combine_prune_for_new_kernel(state, startup_level);
-  build_phase_record(state, kBuildPhaseCombinePruneNew, phase_t0);
+  build_phase_record(state, kBuildPhaseCombinePruneUpper, phase_t0);
 }
 
 __global__ void build_add_reverse_kernel(GpuGraphState *state) {
+  uint64_t phase_t0 = build_phase_begin(state);
   add_reverse_edges_kernel(state);
+  build_phase_record(state, kBuildPhaseAddReverse, phase_t0);
 }
 
 __global__ void build_sort_prune_old_kernel(GpuGraphState *state) {
