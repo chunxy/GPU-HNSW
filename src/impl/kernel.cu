@@ -1883,14 +1883,16 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
 #ifndef NDEBUG
           debug_search_lower_check_cand(state, cand, node, lv, vid, "beam neighbor");
 #endif
-          uint32_t prev_tag = 0;
-          if (tx == 0) {
-            prev_tag = atomicExch(&visited[cand], visited_tag);
-          }
-          prev_tag = __shfl_sync(0xffffffff, prev_tag, 0);
+          // uint32_t prev_tag = 0;
+          // if (tx == 0) {
+          //   prev_tag = atomicExch(&visited[cand], visited_tag);
+          // }
+          // prev_tag = __shfl_sync(0xffffffff, prev_tag, 0);
+          uint32_t prev_tag = visited[cand];
           if (prev_tag == visited_tag) {
             continue;
           }
+          visited[cand] = visited_tag;
           float dist = 0.0f;
           for (int j = tx; j < state->vector_dim; j += warpSize) {
             const float diff = state->vector_data[static_cast<size_t>(cand) * state->vector_dim + j] - query_vec[j];
