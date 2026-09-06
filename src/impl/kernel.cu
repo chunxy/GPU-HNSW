@@ -266,32 +266,78 @@ __device__ void merge_staged_neighbors_into_queues(
   }
 }
 
-__device__ void bitonic_sort_id_by_dis(GpuGraphState *state) {
+__device__ void bitonic_sort_id_by_dis(GpuGraphState *state, int startup_level) {
+  __shared__ float warp_min_dist[SEARCH_WARP_COUNT];
+  __shared__ unsigned warp_min_pos[SEARCH_WARP_COUNT];
   int len = state->old_vec_fetch_offset;
   float *distances = state->news_dist;
   unsigned *ids = state->news_rank;
   if (len <= 1) return;
   const unsigned sort_len = next_power_of_two(len);
   const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
-  for (int vid = blockIdx.x; vid < new_count; vid += gridDim.x) {
-    float *target = distances + vid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
-    unsigned *target_ids = ids + vid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
+  for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
+    float *target = distances + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
+    unsigned *target_ids = ids + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
     const unsigned tid = threadIdx.x;
-    for (unsigned stride = 1; stride < sort_len; stride <<= 1) {
-      for (unsigned step = stride; step > 0; step >>= 1) {
-        for (unsigned k = tid; k < sort_len / 2; k += blockDim.x) {
-          unsigned a = 2 * step * (k / step);
-          unsigned b = k % step;
-          unsigned u = ((step == stride) ? (a + step - 1 - b) : (a + b));
-          unsigned d = a + b + step;
-          if (d < len && target[u] > target[d]) {
-            swap(target[u], target[d]);
-            swap(target_ids[u], target_ids[d]);
+    const uint32_t new_id = state->cur_element_count + bid;
+    if (state->element_levels[new_id] >= static_cast<uint32_t>(startup_level)) {
+      for (unsigned stride = 1; stride < sort_len; stride <<= 1) {
+        for (unsigned step = stride; step > 0; step >>= 1) {
+          for (unsigned k = tid; k < sort_len / 2; k += blockDim.x) {
+            unsigned a = 2 * step * (k / step);
+            unsigned b = k % step;
+            unsigned u = ((step == stride) ? (a + step - 1 - b) : (a + b));
+            unsigned d = a + b + step;
+            if (d < len && target[u] > target[d]) {
+              swap(target[u], target[d]);
+              swap(target_ids[u], target_ids[d]);
+            }
           }
+          __syncthreads();
         }
-        __syncthreads();
+      }
+      continue;
+    }
+
+    float best_dist = __int_as_float(0x7f800000);
+    unsigned best_pos = ~0U;
+    for (unsigned i = tid; i < static_cast<unsigned>(len); i += blockDim.x) {
+      const float dist = target[i];
+      if (dist < best_dist || (dist == best_dist && i < best_pos)) {
+        best_dist = dist;
+        best_pos = i;
       }
     }
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      const float other_dist = __shfl_down_sync(0xffffffff, best_dist, offset);
+      const unsigned other_pos = __shfl_down_sync(0xffffffff, best_pos, offset);
+      if (other_dist < best_dist || (other_dist == best_dist && other_pos < best_pos)) {
+        best_dist = other_dist;
+        best_pos = other_pos;
+      }
+    }
+    const int lane = threadIdx.x % warpSize;
+    const int warp = threadIdx.x / warpSize;
+    if (lane == 0) {
+      warp_min_dist[warp] = best_dist;
+      warp_min_pos[warp] = best_pos;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      best_dist = warp_min_dist[0];
+      best_pos = warp_min_pos[0];
+      for (int i = 1; i < SEARCH_WARP_COUNT; ++i) {
+        const float dist = warp_min_dist[i];
+        const unsigned pos = warp_min_pos[i];
+        if (dist < best_dist || (dist == best_dist && pos < best_pos)) {
+          best_dist = dist;
+          best_pos = pos;
+        }
+      }
+      swap(target[0], target[best_pos]);
+      swap(target_ids[0], target_ids[best_pos]);
+    }
+    __syncthreads();
   }
 }
 
@@ -1159,8 +1205,9 @@ __global__ void build_dist_old_new_and_new_new_kernel(GpuGraphState *state) {
 __global__ void build_sort_and_connect_upper_kernel(GpuGraphState *state) {
   const int startup_level = compute_startup_level(state);
   uint64_t phase_t0 = build_phase_begin(state);
-  // For the new vectors, sort the aggregated old vectors by distance
-  bitonic_sort_id_by_dis(state);
+  // Every new vector needs the closest old vector as the lower-search entry.
+  // Only vectors that reach startup_level need the complete ordering for upper pruning.
+  bitonic_sort_id_by_dis(state, startup_level);
   build_phase_record(state, kBuildPhaseSortOldByDist, phase_t0);
 
   phase_t0 = build_phase_begin(state);
