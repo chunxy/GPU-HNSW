@@ -761,23 +761,14 @@ __device__ void connect_new_to_old_at_upper_kernel(GpuGraphState *state, int sta
           assert(false);
         }
 #endif
-        int pos = atomicAdd((uint32_t *)linkl, 1);
-#ifndef NDEBUG
-        const uint32_t capacity = link_capacity_at_level(state, lv);
-        if (pos >= capacity) {
-          printf(
-              "Fatal: new node link list out of bound at level %d for node %u: pos=%u, capacity=%u\n",
-              lv,
-              vid,
-              pos,
-              capacity);
-          assert(false);
-        }
-#endif
-        datal[pos] = cand;
-        distl[pos] = ranked_dist[neigh_rank[i]];
+        datal[i] = cand;
+        distl[i] = ranked_dist[neigh_rank[i]];
       }
-      // __syncthreads();
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        setListCount(linkl, curr_neigh_cnt);
+      }
+      __syncthreads();
     }
   }
 }
