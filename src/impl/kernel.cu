@@ -41,7 +41,6 @@ __device__ int compute_startup_level(GpuGraphState *state) {
 
 constexpr unsigned long long kRandomLevelSeed = 0x9E3779B97F4A7C15ULL;
 constexpr uint32_t kChangedOldLinkFlag = 1U << 31;
-constexpr uint32_t kLinkCountMask = ~kChangedOldLinkFlag;
 }  // namespace
 
 struct Neighbor {
@@ -122,7 +121,8 @@ __device__ uint32_t get_frozen_link_count(GpuGraphState *state, uint32_t interna
       state->element_levels[internal_id] < level) {
     return 0;
   }
-  return state->frozen_link_counts[frozen_link_count_offset(state, internal_id, level)] & kLinkCountMask;
+  // Reverse edges are appended after search, so the live count is the frozen prefix.
+  return getListCount(get_level_linklist(state, internal_id, level));
 }
 
 __device__ uint32_t changed_old_link_level_offset(GpuGraphState *state, int level) {
@@ -1295,8 +1295,11 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     if (const cudaError_t err = sync_kernel("build_dist_old_new_and_new_new_kernel", i); err != cudaSuccess) return err;
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_sort_and_connect_upper_kernel", i); err != cudaSuccess) return err;
-    build_snapshot_frozen_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
-    if (const cudaError_t err = sync_kernel("build_snapshot_frozen_kernel", i); err != cudaSuccess) return err;
+    // Reverse edges are only appended in build_add_reverse_kernel, after search.
+    // Old lists are stable during search; get_frozen_link_count reads live size.
+    // build_snapshot_frozen_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    // if (const cudaError_t err = sync_kernel("build_snapshot_frozen_kernel", i); err != cudaSuccess) return err;
+    // news_*[0] needs to be used as the entry; then news_* become the scratch pad.
     build_search_knn_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_search_knn_lower_kernel", i); err != cudaSuccess) return err;
     build_combine_prune_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
