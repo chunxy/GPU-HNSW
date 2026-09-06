@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <cub/block/block_radix_sort.cuh>
 #include <type_traits>
 #include "hnswalg-lite.h"
 #include "kernel.cuh"
@@ -263,6 +264,47 @@ __device__ void merge_staged_neighbors_into_queues(
         *topq_max = topq[0].distance;
       }
     }
+  }
+}
+
+__device__ void sort_new_new_by_dis(GpuGraphState *state) {
+  constexpr int kItemsPerThread = BATCHSZ_PER_NEW / BLOCK_DIM;
+  static_assert(BATCHSZ_PER_NEW % BLOCK_DIM == 0);
+  using BlockRadixSort = cub::BlockRadixSort<float, BLOCK_DIM, kItemsPerThread, uint32_t>;
+  __shared__ typename BlockRadixSort::TempStorage sort_storage;
+
+  const int new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
+  if (new_count <= 1) return;
+
+  for (int bid = blockIdx.x; bid < new_count; bid += gridDim.x) {
+    float *target = state->news_dist + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES;
+    uint32_t *target_ids = state->news_rank + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW) + LEVEL_SZ_THRES;
+
+    float thread_dist[kItemsPerThread];
+    uint32_t thread_ids[kItemsPerThread];
+#pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+      const int index = threadIdx.x * kItemsPerThread + item;
+      if (index < new_count) {
+        thread_dist[item] = target[index];
+        thread_ids[item] = target_ids[index];
+      } else {
+        thread_dist[item] = __int_as_float(0x7f800000);
+        thread_ids[item] = 0;
+      }
+    }
+
+    BlockRadixSort(sort_storage).Sort(thread_dist, thread_ids);
+
+#pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+      const int index = threadIdx.x * kItemsPerThread + item;
+      if (index < new_count) {
+        target[index] = thread_dist[item];
+        target_ids[index] = thread_ids[item];
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -797,21 +839,48 @@ __device__ void combine_prune_one_level(
   uint32_t *linkl = get_level_linklist(state, vid, lv);
   uint32_t *datal = (uint32_t *)(linkl + 1);
   float *distl = get_level_linklist_dist(state, vid, lv);
-  if (threadIdx.x == 0) {
-    *shared_sz = in_sz;
-  }
+  constexpr uint32_t kMergeScratchOffset = TOPQ_SZ;
+  static_assert(2 * TOPQ_SZ <= LEVEL_SZ_THRES);
   for (int i = threadIdx.x; i < static_cast<int>(in_sz); i += blockDim.x) {
-    ranked_dist[i] = in_dists[i];
-    ranked_cand[i] = in_ids[i];
+    ranked_dist[kMergeScratchOffset + i] = in_dists[i];
+    ranked_cand[kMergeScratchOffset + i] = in_ids[i];
   }
   __syncthreads();
-  static_assert(LEVEL_SZ_THRES - MAX_M0 >= BATCHSZ_PER_NEW);  // Avoid overwriting when moving data.
-  for (int i = threadIdx.x; i < new_count; i += blockDim.x) {
-    if (state->element_levels[state->cur_element_count + i] >= lv) {
-      uint32_t pos = atomicAdd(shared_sz, 1);
-      ranked_dist[pos] = ranked_dist[i + LEVEL_SZ_THRES];
-      ranked_cand[pos] = ranked_cand[i + LEVEL_SZ_THRES];
+
+  if (threadIdx.x == 0) {
+    const uint32_t *first_ids = ranked_cand + kMergeScratchOffset;
+    const float *first_dists = ranked_dist + kMergeScratchOffset;
+    const uint32_t *second_ids = ranked_cand + LEVEL_SZ_THRES;
+    const float *second_dists = ranked_dist + LEVEL_SZ_THRES;
+    const uint32_t output_limit = state->ef_construction;
+    uint32_t first = 0;
+    uint32_t second = 0;
+    uint32_t out = 0;
+
+    while (out < output_limit) {
+      while (second < static_cast<uint32_t>(new_count) &&
+             state->element_levels[second_ids[second]] < static_cast<uint32_t>(lv)) {
+        ++second;
+      }
+
+      const bool has_first = first < in_sz;
+      const bool has_second = second < static_cast<uint32_t>(new_count);
+      if (!has_first && !has_second) {
+        break;
+      }
+
+      if (has_first && (!has_second || first_dists[first] <= second_dists[second])) {
+        ranked_dist[out] = first_dists[first];
+        ranked_cand[out] = first_ids[first];
+        ++first;
+      } else {
+        ranked_dist[out] = second_dists[second];
+        ranked_cand[out] = second_ids[second];
+        ++second;
+      }
+      ++out;
     }
+    *shared_sz = out;
   }
   __syncthreads();
   uint32_t sz = *shared_sz;
@@ -836,32 +905,6 @@ __device__ void combine_prune_one_level(
     }
     __syncthreads();
     return;
-  }
-
-  // sort the combined neighbors by distance
-  int sortlen = next_power_of_two(sz);
-  const unsigned tid = threadIdx.x;
-  for (unsigned stride = 1; stride < sortlen; stride <<= 1) {
-    for (unsigned step = stride; step > 0; step >>= 1) {
-      for (unsigned k = tid; k < sortlen / 2; k += blockDim.x) {
-        unsigned a = 2 * step * (k / step);
-        unsigned b = k % step;
-        unsigned u = ((step == stride) ? (a + step - 1 - b) : (a + b));
-        unsigned d = a + b + step;
-        if (d < sz && ranked_dist[u] > ranked_dist[d]) {
-          swap(ranked_dist[u], ranked_dist[d]);
-          swap(ranked_cand[u], ranked_cand[d]);
-        }
-      }
-      __syncthreads();
-    }
-  }
-
-  // Heuristic prune only the closest ef_construction (CPU HNSW does the
-  // same on the search hit list). The bitonic pass already ranked the
-  // full combined list, so the prefix is the nearest efc.
-  if (sz > state->ef_construction) {
-    sz = state->ef_construction;
   }
 
 #ifndef NDEBUG
@@ -1193,6 +1236,12 @@ __global__ void build_dist_old_new_and_new_new_kernel(GpuGraphState *state) {
   build_phase_record(state, kBuildPhaseDistNewNew, phase_t0);
 }
 
+__global__ void build_sort_new_new_kernel(GpuGraphState *state) {
+  const uint64_t phase_t0 = build_phase_begin(state);
+  sort_new_new_by_dis(state);
+  build_phase_record(state, kBuildPhaseSortNewNew, phase_t0);
+}
+
 __global__ void build_sort_and_connect_upper_kernel(GpuGraphState *state) {
   const int startup_level = compute_startup_level(state);
   uint64_t phase_t0 = build_phase_begin(state);
@@ -1284,6 +1333,8 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     build_compute_level_delimiter_kernel<<<1, 1>>>(state);
     build_dist_old_new_and_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_dist_old_new_and_new_new_kernel", i); err != cudaSuccess) return err;
+    build_sort_new_new_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
+    if (const cudaError_t err = sync_kernel("build_sort_new_new_kernel", i); err != cudaSuccess) return err;
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_sort_and_connect_upper_kernel", i); err != cudaSuccess) return err;
     // Reverse edges are only appended in build_add_reverse_kernel, after search.
