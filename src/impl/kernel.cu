@@ -1721,10 +1721,23 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
   }
   __syncthreads();
 #ifdef PROFILE_BUILD_PHASES
-  uint64_t n_expand = 0;
-  uint64_t clear_cycles = 0;
-  uint64_t t_mark = 0;
-  if (state->profile_build_phases && threadIdx.x == 0) t_mark = clock64();
+  __shared__ uint64_t profile_n_expand;
+  __shared__ uint64_t profile_clear_cycles;
+  __shared__ uint64_t profile_greedy_cycles;
+  __shared__ uint64_t profile_beam_cycles;
+  __shared__ uint64_t profile_topq_order_cycles;
+  __shared__ uint64_t profile_prune_cycles;
+  __shared__ uint64_t profile_total_t0;
+  uint64_t profile_t0 = 0;
+  if (state->profile_build_phases && threadIdx.x == 0) {
+    profile_n_expand = 0;
+    profile_clear_cycles = 0;
+    profile_greedy_cycles = 0;
+    profile_beam_cycles = 0;
+    profile_topq_order_cycles = 0;
+    profile_prune_cycles = 0;
+    profile_total_t0 = clock64();
+  }
 #endif
   int steal_phase = 0;
   while (true) {
@@ -1800,6 +1813,9 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
     float curr_dist = __int_as_float(curr_dist_bits_shared);
 
     int lv = startup_lv - 1;
+#ifdef PROFILE_BUILD_PHASES
+    if (state->profile_build_phases && threadIdx.x == 0) profile_t0 = clock64();
+#endif
     while (lv > lvl) {
       while (1) {
 #ifndef NDEBUG
@@ -1873,6 +1889,11 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
       }
       lv--;
     }
+#ifdef PROFILE_BUILD_PHASES
+    if (state->profile_build_phases && threadIdx.x == 0) {
+      profile_greedy_cycles += clock64() - profile_t0;
+    }
+#endif
     // Search and insert at current level.
     if (lv > lvl) {  // In case the greedy expansion ends due to break.
       lv = lvl;
@@ -1894,8 +1915,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
       __syncthreads();
       if (visited_wrap) {
 #ifdef PROFILE_BUILD_PHASES
-        uint64_t t_clear = 0;
-        if (state->profile_build_phases && threadIdx.x == 0) t_clear = clock64();
+        if (state->profile_build_phases && threadIdx.x == 0) profile_t0 = clock64();
 #endif
         for (int i = threadIdx.x; i < state->max_elements; i += blockDim.x) {
           visited[i] = 0;
@@ -1903,11 +1923,14 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
         __syncthreads();
 #ifdef PROFILE_BUILD_PHASES
         if (state->profile_build_phases && threadIdx.x == 0) {
-          clear_cycles += clock64() - t_clear;
+          profile_clear_cycles += clock64() - profile_t0;
         }
 #endif
       }
 
+#ifdef PROFILE_BUILD_PHASES
+      if (state->profile_build_phases && threadIdx.x == 0) profile_t0 = clock64();
+#endif
       while (true) {
         // All threads compute the stop test from already-volatile queue sizes
         // so they cannot diverge on a stale shared `search_continue`.
@@ -1920,7 +1943,7 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
         }
 #ifdef PROFILE_BUILD_PHASES
         if (state->profile_build_phases && threadIdx.x == 0) {
-          ++n_expand;
+          ++profile_n_expand;
         }
 #endif
 
@@ -2013,6 +2036,11 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
         }
         __syncthreads();
       }
+#ifdef PROFILE_BUILD_PHASES
+      if (state->profile_build_phases && threadIdx.x == 0) {
+        profile_beam_cycles += clock64() - profile_t0;
+      }
+#endif
 
 #ifndef NDEBUG
       debug_search_lower_check_node_level(state, static_cast<uint32_t>(vid), lv, vid, "writeback new");
@@ -2028,12 +2056,24 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
       }
       auto ranked_cand = state->news_rank + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
       auto ranked_dist = state->news_dist + bid * (LEVEL_SZ_THRES + BATCHSZ_PER_NEW);
+#ifdef PROFILE_BUILD_PHASES
+      if (state->profile_build_phases && threadIdx.x == 0) profile_t0 = clock64();
+#endif
       const int write_sz = min(topq_sz, TOPQ_SZ);
-      for (int i = threadIdx.x; i < write_sz; i += blockDim.x) {
-        ranked_cand[i] = topq[i].nodeid;
-        ranked_dist[i] = topq[i].distance;
+      if (threadIdx.x == 0) {
+        for (int i = write_sz - 1; i >= 0; --i) {
+          ranked_cand[i] = topq[0].nodeid;
+          ranked_dist[i] = topq[0].distance;
+          MaxPqPop(topq, &topq_sz);
+        }
       }
       __syncthreads();
+#ifdef PROFILE_BUILD_PHASES
+      if (state->profile_build_phases && threadIdx.x == 0) {
+        profile_topq_order_cycles += clock64() - profile_t0;
+      }
+      if (state->profile_build_phases && threadIdx.x == 0) profile_t0 = clock64();
+#endif
       combine_prune_one_level(
           state,
           vid,
@@ -2050,6 +2090,11 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
           prune_neigh_rank,
           prune_mask,
           &prune_can_continue);
+#ifdef PROFILE_BUILD_PHASES
+      if (state->profile_build_phases && threadIdx.x == 0) {
+        profile_prune_cycles += clock64() - profile_t0;
+      }
+#endif
 #ifndef NDEBUG
       {
         uint32_t *linkl = get_level_linklist(state, vid, lv);
@@ -2096,9 +2141,13 @@ __device__ void search_knn_at_lower_kernel(GpuGraphState *state, const int start
     if (state->profile_build_phases) {
       const uint32_t batch = state->cur_element_count / BATCHSZ_PER_NEW;
       const uint32_t idx = batch * GRID_DIM + blockIdx.x;
-      state->search_block_cycles[idx] = clock64() - t_mark;
-      state->search_block_clear_cycles[idx] = clear_cycles;
-      state->search_block_expands[idx] = n_expand;
+      state->search_block_cycles[idx] = clock64() - profile_total_t0;
+      state->search_block_clear_cycles[idx] = profile_clear_cycles;
+      state->search_block_greedy_cycles[idx] = profile_greedy_cycles;
+      state->search_block_beam_cycles[idx] = profile_beam_cycles;
+      state->search_block_topq_order_cycles[idx] = profile_topq_order_cycles;
+      state->search_block_prune_cycles[idx] = profile_prune_cycles;
+      state->search_block_expands[idx] = profile_n_expand;
     }
 #endif
   }
@@ -2205,6 +2254,10 @@ void summarize_batch_imbalance(const uint64_t *values, uint64_t batch_begin, uin
 void print_search_block_profile(
     const uint64_t *block_cycles,
     const uint64_t *block_clear_cycles,
+    const uint64_t *block_greedy_cycles,
+    const uint64_t *block_beam_cycles,
+    const uint64_t *block_topq_order_cycles,
+    const uint64_t *block_prune_cycles,
     const uint64_t *block_expands,
     uint64_t batch_count) {
   if (batch_count == 0 || block_cycles == nullptr) {
@@ -2222,23 +2275,51 @@ void print_search_block_profile(
 
   unsigned long long sum_max_search = 0;
   unsigned long long sum_mean_search = 0;
+  unsigned long long sum_mean_greedy = 0;
+  unsigned long long sum_mean_beam = 0;
+  unsigned long long sum_mean_topq_order = 0;
+  unsigned long long sum_mean_prune = 0;
+  unsigned long long sum_critical_greedy = 0;
+  unsigned long long sum_critical_beam = 0;
+  unsigned long long sum_critical_topq_order = 0;
+  unsigned long long sum_critical_prune = 0;
   unsigned long long sum_max_clear = 0;
   unsigned long long sum_expands = 0;
   for (uint64_t b = 0; b < batch_count; ++b) {
     uint64_t mx_search = 0;
     uint64_t mx_clear = 0;
+    int critical_block = 0;
     unsigned long long row_search = 0;
+    unsigned long long row_greedy = 0;
+    unsigned long long row_beam = 0;
+    unsigned long long row_topq_order = 0;
+    unsigned long long row_prune = 0;
     for (int blk = 0; blk < GRID_DIM; ++blk) {
       const uint64_t search = block_cycles[b * GRID_DIM + blk];
       const uint64_t clear = block_clear_cycles[b * GRID_DIM + blk];
-      mx_search = std::max(mx_search, search);
+      if (search > mx_search) {
+        mx_search = search;
+        critical_block = blk;
+      }
       mx_clear = std::max(mx_clear, clear);
       row_search += search;
+      row_greedy += block_greedy_cycles[b * GRID_DIM + blk];
+      row_beam += block_beam_cycles[b * GRID_DIM + blk];
+      row_topq_order += block_topq_order_cycles[b * GRID_DIM + blk];
+      row_prune += block_prune_cycles[b * GRID_DIM + blk];
       sum_expands += block_expands[b * GRID_DIM + blk];
     }
     sum_max_search += mx_search;
     sum_max_clear += mx_clear;
     sum_mean_search += row_search / GRID_DIM;
+    sum_mean_greedy += row_greedy / GRID_DIM;
+    sum_mean_beam += row_beam / GRID_DIM;
+    sum_mean_topq_order += row_topq_order / GRID_DIM;
+    sum_mean_prune += row_prune / GRID_DIM;
+    sum_critical_greedy += block_greedy_cycles[b * GRID_DIM + critical_block];
+    sum_critical_beam += block_beam_cycles[b * GRID_DIM + critical_block];
+    sum_critical_topq_order += block_topq_order_cycles[b * GRID_DIM + critical_block];
+    sum_critical_prune += block_prune_cycles[b * GRID_DIM + critical_block];
   }
 
   fmt::print(
@@ -2258,6 +2339,35 @@ void print_search_block_profile(
       "  search loop   mean-block sum {:>10.3f} ms  (mean/max={:.3f}; gap is imbalance tail)\n",
       sum_mean_search / cycles_per_ms,
       sum_max_search > 0 ? static_cast<double>(sum_mean_search) / static_cast<double>(sum_max_search) : 0.0);
+  const unsigned long long measured_mean = sum_mean_greedy + sum_mean_beam + sum_mean_topq_order + sum_mean_prune;
+  const unsigned long long sum_mean_other = sum_mean_search - std::min(sum_mean_search, measured_mean);
+  fmt::print("  mean-block phase breakdown:\n");
+  fmt::print(
+      "    greedy descent            {:>10.3f} ms  ({:>5.1f}%)\n",
+      sum_mean_greedy / cycles_per_ms,
+      sum_mean_search > 0 ? 100.0 * static_cast<double>(sum_mean_greedy) / sum_mean_search : 0.0);
+  fmt::print(
+      "    beam traversal            {:>10.3f} ms  ({:>5.1f}%)\n",
+      sum_mean_beam / cycles_per_ms,
+      sum_mean_search > 0 ? 100.0 * static_cast<double>(sum_mean_beam) / sum_mean_search : 0.0);
+  fmt::print(
+      "    topq ordering             {:>10.3f} ms  ({:>5.1f}%)\n",
+      sum_mean_topq_order / cycles_per_ms,
+      sum_mean_search > 0 ? 100.0 * static_cast<double>(sum_mean_topq_order) / sum_mean_search : 0.0);
+  fmt::print(
+      "    merge + heuristic prune  {:>10.3f} ms  ({:>5.1f}%)\n",
+      sum_mean_prune / cycles_per_ms,
+      sum_mean_search > 0 ? 100.0 * static_cast<double>(sum_mean_prune) / sum_mean_search : 0.0);
+  fmt::print(
+      "    queue init + overhead     {:>10.3f} ms  ({:>5.1f}%)\n",
+      sum_mean_other / cycles_per_ms,
+      sum_mean_search > 0 ? 100.0 * static_cast<double>(sum_mean_other) / sum_mean_search : 0.0);
+  fmt::print(
+      "  critical-block contribution: greedy {:.1f}%, beam {:.1f}%, topq ordering {:.1f}%, prune {:.1f}%\n",
+      sum_max_search > 0 ? 100.0 * static_cast<double>(sum_critical_greedy) / sum_max_search : 0.0,
+      sum_max_search > 0 ? 100.0 * static_cast<double>(sum_critical_beam) / sum_max_search : 0.0,
+      sum_max_search > 0 ? 100.0 * static_cast<double>(sum_critical_topq_order) / sum_max_search : 0.0,
+      sum_max_search > 0 ? 100.0 * static_cast<double>(sum_critical_prune) / sum_max_search : 0.0);
   fmt::print(
       "  beam expansions total {}  ({:.1f} per block-batch)\n",
       sum_expands,

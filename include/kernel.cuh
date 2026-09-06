@@ -77,6 +77,10 @@ struct GpuGraphState {
   // search_knn_at_lower: per (batch, block) counters, layout batch * GRID_DIM + blockIdx
   uint64_t *search_block_cycles{nullptr};
   uint64_t *search_block_clear_cycles{nullptr};
+  uint64_t *search_block_greedy_cycles{nullptr};
+  uint64_t *search_block_beam_cycles{nullptr};
+  uint64_t *search_block_topq_order_cycles{nullptr};
+  uint64_t *search_block_prune_cycles{nullptr};
   uint64_t *search_block_expands{nullptr};
 #endif
 };

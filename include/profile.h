@@ -6,6 +6,7 @@ enum BuildPhase : int {
   kBuildPhaseAggregate = 0,
   kBuildPhaseDistOldNew,
   kBuildPhaseDistNewNew,
+  kBuildPhaseSortNewNew,
   kBuildPhaseSortOldByDist,
   kBuildPhaseConnectUpper,
   kBuildPhaseSnapshotFrozen,
@@ -27,6 +28,8 @@ inline const char *build_phase_name(BuildPhase phase) {
       return "dist_old_new";
     case kBuildPhaseDistNewNew:
       return "dist_new_new";
+    case kBuildPhaseSortNewNew:
+      return "sort_new_new";
     case kBuildPhaseSortOldByDist:
       return "sort_old_by_dist";
     case kBuildPhaseConnectUpper:
@@ -53,6 +56,10 @@ void print_build_phase_profile(const uint64_t *cycles, uint64_t batch_count);
 void print_search_block_profile(
     const uint64_t *block_cycles,
     const uint64_t *block_clear_cycles,
+    const uint64_t *block_greedy_cycles,
+    const uint64_t *block_beam_cycles,
+    const uint64_t *block_topq_order_cycles,
+    const uint64_t *block_prune_cycles,
     const uint64_t *block_expands,
     uint64_t batch_count);
 

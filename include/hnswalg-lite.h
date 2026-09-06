@@ -248,6 +248,10 @@ class HierarchicalNswLite {
     cuda_free_buffer(host_gpu_graph_state_.build_phase_cycles);
     cuda_free_buffer(host_gpu_graph_state_.search_block_cycles);
     cuda_free_buffer(host_gpu_graph_state_.search_block_clear_cycles);
+    cuda_free_buffer(host_gpu_graph_state_.search_block_greedy_cycles);
+    cuda_free_buffer(host_gpu_graph_state_.search_block_beam_cycles);
+    cuda_free_buffer(host_gpu_graph_state_.search_block_topq_order_cycles);
+    cuda_free_buffer(host_gpu_graph_state_.search_block_prune_cycles);
     cuda_free_buffer(host_gpu_graph_state_.search_block_expands);
 #endif
     cuda_free_buffer(host_gpu_graph_state_.news_dist);
@@ -1084,6 +1088,15 @@ class HierarchicalNswLite {
     gpuMemset(host_gpu_graph_state_.search_block_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
     gpuMalloc(&host_gpu_graph_state_.search_block_clear_cycles, sizeof(uint64_t) * search_block_profile_count);
     gpuMemset(host_gpu_graph_state_.search_block_clear_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
+    gpuMalloc(&host_gpu_graph_state_.search_block_greedy_cycles, sizeof(uint64_t) * search_block_profile_count);
+    gpuMemset(host_gpu_graph_state_.search_block_greedy_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
+    gpuMalloc(&host_gpu_graph_state_.search_block_beam_cycles, sizeof(uint64_t) * search_block_profile_count);
+    gpuMemset(host_gpu_graph_state_.search_block_beam_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
+    gpuMalloc(&host_gpu_graph_state_.search_block_topq_order_cycles, sizeof(uint64_t) * search_block_profile_count);
+    gpuMemset(
+        host_gpu_graph_state_.search_block_topq_order_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
+    gpuMalloc(&host_gpu_graph_state_.search_block_prune_cycles, sizeof(uint64_t) * search_block_profile_count);
+    gpuMemset(host_gpu_graph_state_.search_block_prune_cycles, 0, sizeof(uint64_t) * search_block_profile_count);
     gpuMalloc(&host_gpu_graph_state_.search_block_expands, sizeof(uint64_t) * search_block_profile_count);
     gpuMemset(host_gpu_graph_state_.search_block_expands, 0, sizeof(uint64_t) * search_block_profile_count);
     host_gpu_graph_state_.profile_build_phases = profile_build_phases_;
@@ -1296,6 +1309,10 @@ class HierarchicalNswLite {
             static_cast<size_t>(device_state.build_batch_count) * static_cast<size_t>(GRID_DIM);
         std::vector<uint64_t> search_cycles(search_block_profile_count, 0ULL);
         std::vector<uint64_t> search_clear(search_block_profile_count, 0ULL);
+        std::vector<uint64_t> search_greedy(search_block_profile_count, 0ULL);
+        std::vector<uint64_t> search_beam(search_block_profile_count, 0ULL);
+        std::vector<uint64_t> search_topq_order(search_block_profile_count, 0ULL);
+        std::vector<uint64_t> search_prune(search_block_profile_count, 0ULL);
         std::vector<uint64_t> search_expands(search_block_profile_count, 0ULL);
         CUDA_CHECK(cudaMemcpy(
             search_cycles.data(),
@@ -1308,12 +1325,39 @@ class HierarchicalNswLite {
             sizeof(uint64_t) * search_block_profile_count,
             cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(
+            search_greedy.data(),
+            device_state.search_block_greedy_cycles,
+            sizeof(uint64_t) * search_block_profile_count,
+            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(
+            search_beam.data(),
+            device_state.search_block_beam_cycles,
+            sizeof(uint64_t) * search_block_profile_count,
+            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(
+            search_topq_order.data(),
+            device_state.search_block_topq_order_cycles,
+            sizeof(uint64_t) * search_block_profile_count,
+            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(
+            search_prune.data(),
+            device_state.search_block_prune_cycles,
+            sizeof(uint64_t) * search_block_profile_count,
+            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(
             search_expands.data(),
             device_state.search_block_expands,
             sizeof(uint64_t) * search_block_profile_count,
             cudaMemcpyDeviceToHost));
         print_search_block_profile(
-            search_cycles.data(), search_clear.data(), search_expands.data(), device_state.build_batch_count);
+            search_cycles.data(),
+            search_clear.data(),
+            search_greedy.data(),
+            search_beam.data(),
+            search_topq_order.data(),
+            search_prune.data(),
+            search_expands.data(),
+            device_state.build_batch_count);
       }
       profile_build_phases_ = false;
       host_gpu_graph_state_.profile_build_phases = false;
