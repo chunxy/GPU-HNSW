@@ -63,7 +63,12 @@ struct GpuGraphState {
   // Per-block generation counters for `visited`. Persist across batches so a
   // block only memsets its slice when the tag wraps.
   uint32_t *visited_tags{nullptr};
-  uint32_t *frozen_link_counts{nullptr};
+  // Per-(level, old node) heads of batch-local reverse-edge chains.
+  uint32_t *reverse_edge_heads{nullptr};
+  uint32_t *reverse_edge_sources{nullptr};
+  float *reverse_edge_distances{nullptr};
+  uint32_t *reverse_edge_next{nullptr};
+  uint32_t *reverse_edge_counts{nullptr};
   uint32_t *changed_old_links{nullptr};
   uint32_t *changed_old_link_counts{nullptr};
   // Steal counter for search_knn_at_lower leftovers. Reset each batch.
@@ -112,6 +117,4 @@ __device__ void prune_for_old_kernel(GpuGraphState *state);
 __device__ void prune_neighbors_for_all_kernel(GpuGraphState *state);
 
 __device__ void search_knn_at_lower_kernel(GpuGraphState *state, int startup_level);
-
-__device__ void snapshot_frozen_link_counts_kernel(GpuGraphState *state, int max_level);
 

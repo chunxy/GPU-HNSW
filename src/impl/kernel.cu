@@ -41,7 +41,7 @@ __device__ int compute_startup_level(GpuGraphState *state) {
 }
 
 constexpr unsigned long long kRandomLevelSeed = 0x9E3779B97F4A7C15ULL;
-constexpr uint32_t kChangedOldLinkFlag = 1U << 31;
+constexpr uint32_t kInvalidReverseEdge = ~0U;
 }  // namespace
 
 struct Neighbor {
@@ -113,7 +113,7 @@ __device__ uint32_t link_capacity_at_level(const GpuGraphState *state, int level
   return level == 0 ? state->maxM0 + REVERSE_HEADROOM : state->M + REVERSE_HEADROOM;
 }
 
-__device__ uint32_t frozen_link_count_offset(GpuGraphState *state, uint32_t internal_id, int level) {
+__device__ size_t reverse_edge_head_offset(GpuGraphState *state, uint32_t internal_id, int level) {
   return level * state->max_elements + internal_id;
 }
 
@@ -126,25 +126,42 @@ __device__ uint32_t get_frozen_link_count(GpuGraphState *state, uint32_t interna
   return getListCount(get_level_linklist(state, internal_id, level));
 }
 
+__device__ uint32_t reverse_edge_level_offset(GpuGraphState *state, int level) {
+  return level * BATCHSZ_PER_NEW * state->maxM0;
+}
+
 __device__ uint32_t changed_old_link_level_offset(GpuGraphState *state, int level) {
   return level * BATCHSZ_PER_NEW * state->maxM0;
 }
 
-__device__ void record_changed_old_link(GpuGraphState *state, uint32_t internal_id, int level) {
-  if (internal_id >= state->cur_element_count || level < 0 || level >= MAX_HNSW_LEVEL) return;
-
-  uint32_t *frozen_count = state->frozen_link_counts + frozen_link_count_offset(state, internal_id, level);
-  const uint32_t previous = atomicOr(frozen_count, kChangedOldLinkFlag);
-  if ((previous & kChangedOldLinkFlag) != 0) return;
-
-  const uint32_t offset = atomicAdd(&state->changed_old_link_counts[level], 1U);
+__device__ void append_reverse_edge(GpuGraphState *state, uint32_t other, uint32_t source, float distance, int level) {
+  const uint32_t level_capacity = BATCHSZ_PER_NEW * state->maxM0;
+  const uint32_t slot = atomicAdd(&state->reverse_edge_counts[level], 1U);
 #ifndef NDEBUG
-  if (offset >= BATCHSZ_PER_NEW * state->maxM0) {
-    printf("Fatal: changed_old_links out of bound at level %d\n", level);
+  if (slot >= level_capacity) {
+    printf("Fatal: reverse-edge mailbox out of bound at level %d\n", level);
     assert(false);
+    return;
   }
 #endif
-  state->changed_old_links[changed_old_link_level_offset(state, level) + offset] = internal_id;
+  const uint32_t edge_offset = reverse_edge_level_offset(state, level) + slot;
+  state->reverse_edge_sources[edge_offset] = source;
+  state->reverse_edge_distances[edge_offset] = distance;
+
+  const size_t head_offset = reverse_edge_head_offset(state, other, level);
+  const uint32_t previous = atomicExch(&state->reverse_edge_heads[head_offset], slot);
+  state->reverse_edge_next[edge_offset] = previous;
+  if (previous != kInvalidReverseEdge) return;
+
+  const uint32_t changed_offset = atomicAdd(&state->changed_old_link_counts[level], 1U);
+#ifndef NDEBUG
+  if (changed_offset >= level_capacity) {
+    printf("Fatal: changed_old_links out of bound at level %d\n", level);
+    assert(false);
+    return;
+  }
+#endif
+  state->changed_old_links[changed_old_link_level_offset(state, level) + changed_offset] = other;
 }
 
 #define mul(x, y) (x * y)
@@ -447,6 +464,7 @@ __device__ void reset_batch_state_kernel(GpuGraphState *state) {
     state->next_bid = 0;
   }
   for (int level = blockIdx.x * blockDim.x + threadIdx.x; level < MAX_HNSW_LEVEL; level += gridDim.x * blockDim.x) {
+    state->reverse_edge_counts[level] = 0;
     state->changed_old_link_counts[level] = 0;
     state->old_vector_level_delimiter[level] = 0;
   }
@@ -1143,67 +1161,17 @@ __device__ void add_reverse_edges_kernel(GpuGraphState *state) {
           continue;
         }
 #endif
-        uint32_t *other_linkl = get_level_linklist(state, other, lv);
-        uint32_t *other_datal = (uint32_t *)(other_linkl) + 1;
-        float *other_distl = get_level_linklist_dist(state, other, lv);
 #ifndef NDEBUG
+        uint32_t *other_linkl = get_level_linklist(state, other, lv);
         if (other_linkl == nullptr) {
           printf("Fatal: add_reverse: other %u null other_linkl at level %d from new %d\n", other, lv, vid);
           assert(false);
           continue;
         }
 #endif
-        const uint32_t pos = atomicAdd((uint32_t *)(other_linkl), 1);
-        record_changed_old_link(state, other, lv);
-#ifndef NDEBUG
-        if (pos >= capacity) {
-          printf(
-              "Fatal: reverse link list out of bound at level %d for node %u "
-              "(pos=%u capacity=%u new=%d sz=%u idx=%u)\n",
-              lv,
-              other,
-              pos,
-              capacity,
-              vid,
-              sz,
-              i);
-          assert(false);
-          continue;
-        }
-#endif
-        other_datal[pos] = vid;
-        other_distl[pos] = distl[i];
+        append_reverse_edge(state, other, static_cast<uint32_t>(vid), distl[i], lv);
       }
       __syncthreads();
-    }
-  }
-}
-
-__device__ void snapshot_frozen_link_counts_kernel(GpuGraphState *state, int startup_level) {
-  if (startup_level < 0) return;
-  startup_level = min(startup_level - 1, state->maxlevel);
-  const uint32_t new_count = min(BATCHSZ_PER_NEW, state->max_elements - state->cur_element_count);
-  const uint32_t node_count = min(state->max_elements, state->cur_element_count + new_count);
-
-  for (int lv = 0; lv <= startup_level; ++lv) {
-    for (uint32_t node_id = threadIdx.x + blockIdx.x * blockDim.x; node_id < node_count;
-         node_id += blockDim.x * gridDim.x) {
-      uint32_t count = 0;
-      if (state->element_levels[node_id] >= lv) {
-        uint32_t *linkl = get_level_linklist(state, node_id, lv);
-        count = getListCount(linkl);
-#ifndef NDEBUG
-        uint32_t *datal = (uint32_t *)(linkl + 1);
-        for (uint32_t i = 0; i < count; ++i) {
-          const uint32_t cand = datal[i];
-          if (state->element_levels[cand] < lv) {
-            printf("Fatal: snapshot found off-level candidate %u at level %d from node %u\n", cand, lv, node_id);
-            assert(false);
-          }
-        }
-#endif
-      }
-      state->frozen_link_counts[frozen_link_count_offset(state, node_id, lv)] = count;
     }
   }
 }
@@ -1256,14 +1224,6 @@ __global__ void build_sort_and_connect_upper_kernel(GpuGraphState *state) {
   build_phase_record(state, kBuildPhaseConnectUpper, phase_t0);
 }
 
-__global__ void build_snapshot_frozen_kernel(GpuGraphState *state) {
-  const int startup_level = compute_startup_level(state);
-  uint64_t phase_t0 = build_phase_begin(state);
-  // Freeze the link counts used while searching lower levels.
-  snapshot_frozen_link_counts_kernel(state, startup_level);
-  build_phase_record(state, kBuildPhaseSnapshotFrozen, phase_t0);
-}
-
 __global__ void build_search_knn_lower_kernel(GpuGraphState *state) {
   const int startup_level = compute_startup_level(state);
   uint64_t phase_t0 = build_phase_begin(state);
@@ -1286,9 +1246,7 @@ __global__ void build_add_reverse_kernel(GpuGraphState *state) {
 
 __global__ void build_sort_prune_old_kernel(GpuGraphState *state) {
   uint64_t phase_t0 = build_phase_begin(state);
-  // Sort and prune only old-node lists that received reverse edges in this batch.
-  bitonic_sort_id_for_ll(state);
-  // Update frozen link counts for the levels that received reverse edges.
+  // One block owns each changed old node and consumes its reverse-edge chain.
   prune_for_old_kernel(state);
   build_phase_record(state, kBuildPhaseSortPruneOld, phase_t0);
 }
@@ -1337,10 +1295,7 @@ cudaError_t launch_build_graph_kernel(GpuGraphState *state) {
     if (const cudaError_t err = sync_kernel("build_sort_new_new_kernel", i); err != cudaSuccess) return err;
     build_sort_and_connect_upper_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_sort_and_connect_upper_kernel", i); err != cudaSuccess) return err;
-    // Reverse edges are only appended in build_add_reverse_kernel, after search.
-    // Old lists are stable during search; get_frozen_link_count reads live size.
-    // build_snapshot_frozen_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
-    // if (const cudaError_t err = sync_kernel("build_snapshot_frozen_kernel", i); err != cudaSuccess) return err;
+    // Reverse edges are emitted after search, so old lists stay stable while searched.
     // news_*[0] needs to be used as the entry; then news_* become the scratch pad.
     build_search_knn_lower_kernel<<<GRID_DIM, BLOCK_DIM>>>(state);
     if (const cudaError_t err = sync_kernel("build_search_knn_lower_kernel", i); err != cudaSuccess) return err;
@@ -1512,99 +1467,206 @@ __device__ void compute_dist_with_old_kernel(GpuGraphState *state) {
   }
 }
 
-// 1 block for 1 old vector
-// assume that neighbor list has been sorted
+// One block owns one changed old vector. Its live list remains at <= M; reverse
+// edges wait in a batch-local chain until this owner merges or prunes them.
 __device__ void prune_for_old_kernel(GpuGraphState *state) {
+  constexpr uint32_t kCandidateCapacity = BATCHSZ_PER_NEW + MAX_M0;
+  constexpr uint32_t kSortCapacity = 4096;
+  static_assert(kSortCapacity >= kCandidateCapacity);
+
+  __shared__ uint32_t candidate_ids[kSortCapacity];
+  __shared__ float candidate_distances[kSortCapacity];
   __shared__ uint32_t prev_neigh_rank;
   __shared__ uint32_t prev_neigh_id;
   __shared__ volatile uint32_t curr_neigh_cnt;
-  __shared__ unsigned char pruned_mask[LEVEL_SZ_THRES + BATCHSZ_PER_NEW];
-  __shared__ bool can_continue;
+  __shared__ unsigned char pruned_mask[kCandidateCapacity];
+  __shared__ int can_continue;
+  __shared__ uint32_t combined_count;
+  __shared__ uint32_t sort_count;
 
   for (int lv = 0; lv <= state->maxlevel; ++lv) {
     const uint32_t count = state->changed_old_link_counts[lv];
     const uint32_t base = changed_old_link_level_offset(state, lv);
     for (uint32_t idx = blockIdx.x; idx < count; idx += gridDim.x) {
       const uint32_t vid = state->changed_old_links[base + idx];
-      int M = lv ? state->M : state->maxM0;
+      const uint32_t M = lv ? state->M : state->maxM0;
+      const uint32_t edge_base = reverse_edge_level_offset(state, lv);
+      const uint32_t edge_capacity = BATCHSZ_PER_NEW * state->maxM0;
+      const size_t head_offset = reverse_edge_head_offset(state, vid, lv);
 
       uint32_t *linkl = get_level_linklist(state, vid, lv);
       uint32_t *datal = (uint32_t *)(linkl + 1);
       float *distl = get_level_linklist_dist(state, vid, lv);
-      int sz = getListCount(linkl);
-
-      if (sz > M) {
+      const uint32_t existing_count = getListCount(linkl);
 #ifndef NDEBUG
-        debug_check_pruned_mask_range(static_cast<uint32_t>(sz), "prune_for_old", static_cast<int>(vid), lv);
+      if (existing_count > M) {
+        printf("Fatal: prune_for_old: live list %u exceeds M %u for node %u level %d\n", existing_count, M, vid, lv);
+        assert(false);
+      }
 #endif
-        if (threadIdx.x == 0) {
-          prev_neigh_rank = 0;
-          prev_neigh_id = datal[0];
-          datal[0] = prev_neigh_id;
-          curr_neigh_cnt = 1;
-        }
-        __syncthreads();
 
-        for (int i = threadIdx.x; i < sz; i += blockDim.x) {
-          pruned_mask[i] = 0;
-        }
-        __syncthreads();
-
-        while (curr_neigh_cnt < M) {
-          if (threadIdx.x == 0) {
-            can_continue = 0;
-          }
-          __syncthreads();
-          const int tx = threadIdx.x % warpSize;  // compute distance along this dimension
-          const int ty = threadIdx.x / warpSize;  // compute for different candidates
-          const int nrow = blockDim.x / warpSize;
-          const float *prev_vec = state->vector_data + static_cast<size_t>(prev_neigh_id) * state->vector_dim;
-
-          for (int i = ty; i < sz; i += nrow) {
-            if (i <= prev_neigh_rank) continue;
-            if (pruned_mask[i] == 0) {
-              can_continue = 1;
-              float dist = 0.0f;
-              const int cand = datal[i];
-              const float *cand_vec = state->vector_data + static_cast<size_t>(cand) * state->vector_dim;
-              for (int j = tx; j < state->vector_dim; j += warpSize) {
-                float diff = cand_vec[j] - prev_vec[j];
-                dist += diff * diff;
-              }
-              for (int lane = warpSize / 2; lane > 0; lane /= 2) {
-                dist += __shfl_down_sync(0xffffffff, dist, lane);
-              }
-              if (tx == 0 && dist < distl[i]) {
-                pruned_mask[i] = 1;
-              }
-            }
-          }
-          __syncthreads();
-          if (!can_continue) {
+      if (threadIdx.x == 0) {
+        uint32_t n = 0;
+        uint32_t edge = state->reverse_edge_heads[head_offset];
+        while (edge != kInvalidReverseEdge) {
+#ifndef NDEBUG
+          if (edge >= edge_capacity) {
+            printf("Fatal: reverse-edge chain has invalid slot %u at level %d for node %u\n", edge, lv, vid);
+            assert(false);
             break;
           }
-          if (threadIdx.x == 0) {
-            for (int i = prev_neigh_rank + 1; i < sz; i++) {
-              if (pruned_mask[i] == 0) {
-                prev_neigh_rank = i;
-                prev_neigh_id = datal[i];
-                distl[curr_neigh_cnt] = distl[i];
-                datal[curr_neigh_cnt] = datal[i];
-                curr_neigh_cnt++;
-                pruned_mask[i] = 1;
-                break;
-              }
+#endif
+          ++n;
+          edge = state->reverse_edge_next[edge_base + edge];
+        }
+        combined_count = existing_count + n;
+        sort_count = next_power_of_two(combined_count);
+#ifndef NDEBUG
+        if (combined_count > kCandidateCapacity) {
+          printf(
+              "Fatal: reverse candidates %u exceed capacity %u at level %d for node %u\n",
+              combined_count,
+              kCandidateCapacity,
+              lv,
+              vid);
+          assert(false);
+        }
+#endif
+      }
+      __syncthreads();
+
+      // The current list is sorted. If all inbound edges fit, insert each one
+      // directly at its distance-ordered position without using headroom.
+      if (combined_count <= M) {
+        if (threadIdx.x == 0) {
+          uint32_t size = existing_count;
+          uint32_t edge = state->reverse_edge_heads[head_offset];
+          while (edge != kInvalidReverseEdge) {
+            const uint32_t edge_offset = edge_base + edge;
+            const uint32_t source = state->reverse_edge_sources[edge_offset];
+            const float distance = state->reverse_edge_distances[edge_offset];
+            uint32_t pos = size;
+            while (pos > 0 && (distance < distl[pos - 1] || (distance == distl[pos - 1] && source < datal[pos - 1]))) {
+              datal[pos] = datal[pos - 1];
+              distl[pos] = distl[pos - 1];
+              --pos;
+            }
+            datal[pos] = source;
+            distl[pos] = distance;
+            ++size;
+            edge = state->reverse_edge_next[edge_offset];
+          }
+          setListCount(linkl, size);
+          state->reverse_edge_heads[head_offset] = kInvalidReverseEdge;
+        }
+        __syncthreads();
+        continue;
+      }
+
+      for (uint32_t i = threadIdx.x; i < existing_count; i += blockDim.x) {
+        candidate_ids[i] = datal[i];
+        candidate_distances[i] = distl[i];
+      }
+      if (threadIdx.x == 0) {
+        uint32_t out = existing_count;
+        uint32_t edge = state->reverse_edge_heads[head_offset];
+        while (edge != kInvalidReverseEdge) {
+          const uint32_t edge_offset = edge_base + edge;
+          candidate_ids[out] = state->reverse_edge_sources[edge_offset];
+          candidate_distances[out] = state->reverse_edge_distances[edge_offset];
+          ++out;
+          edge = state->reverse_edge_next[edge_offset];
+        }
+      }
+      for (uint32_t i = combined_count + threadIdx.x; i < sort_count; i += blockDim.x) {
+        candidate_ids[i] = kInvalidReverseEdge;
+        candidate_distances[i] = __int_as_float(0x7f800000);
+      }
+      __syncthreads();
+
+      // Sort all existing and inbound candidates by distance to this old node.
+      for (uint32_t width = 2; width <= sort_count; width <<= 1) {
+        for (uint32_t stride = width >> 1; stride > 0; stride >>= 1) {
+          for (uint32_t i = threadIdx.x; i < sort_count; i += blockDim.x) {
+            const uint32_t other = i ^ stride;
+            if (other <= i) continue;
+            const bool ascending = (i & width) == 0;
+            const bool greater =
+                candidate_distances[i] > candidate_distances[other] ||
+                (candidate_distances[i] == candidate_distances[other] && candidate_ids[i] > candidate_ids[other]);
+            if (greater == ascending) {
+              swap(candidate_distances[i], candidate_distances[other]);
+              swap(candidate_ids[i], candidate_ids[other]);
             }
           }
           __syncthreads();
         }
+      }
 
-        if (threadIdx.x == 0) {
-          setListCount(linkl, curr_neigh_cnt);
-        }
+      for (uint32_t i = threadIdx.x; i < combined_count; i += blockDim.x) {
+        pruned_mask[i] = 0;
       }
       if (threadIdx.x == 0) {
-        state->frozen_link_counts[frozen_link_count_offset(state, vid, lv)] = getListCount(linkl);
+        prev_neigh_rank = 0;
+        prev_neigh_id = candidate_ids[0];
+        datal[0] = prev_neigh_id;
+        distl[0] = candidate_distances[0];
+        curr_neigh_cnt = 1;
+      }
+      __syncthreads();
+
+      while (curr_neigh_cnt < M) {
+        if (threadIdx.x == 0) {
+          can_continue = 0;
+        }
+        __syncthreads();
+        const int tx = threadIdx.x % warpSize;
+        const int ty = threadIdx.x / warpSize;
+        const int nrow = blockDim.x / warpSize;
+        const float *prev_vec = state->vector_data + static_cast<size_t>(prev_neigh_id) * state->vector_dim;
+
+        for (uint32_t i = ty; i < combined_count; i += nrow) {
+          if (i <= prev_neigh_rank || pruned_mask[i] != 0) continue;
+          if (tx == 0) {
+            atomicExch(&can_continue, 1);
+          }
+          float dist = 0.0f;
+          const uint32_t cand = candidate_ids[i];
+          const float *cand_vec = state->vector_data + static_cast<size_t>(cand) * state->vector_dim;
+          for (int j = tx; j < state->vector_dim; j += warpSize) {
+            const float diff = cand_vec[j] - prev_vec[j];
+            dist += diff * diff;
+          }
+          for (int lane = warpSize / 2; lane > 0; lane /= 2) {
+            dist += __shfl_down_sync(0xffffffff, dist, lane);
+          }
+          if (tx == 0 && dist < candidate_distances[i]) {
+            pruned_mask[i] = 1;
+          }
+        }
+        __syncthreads();
+        if (!can_continue) {
+          break;
+        }
+        if (threadIdx.x == 0) {
+          for (uint32_t i = prev_neigh_rank + 1; i < combined_count; ++i) {
+            if (pruned_mask[i] == 0) {
+              prev_neigh_rank = i;
+              prev_neigh_id = candidate_ids[i];
+              datal[curr_neigh_cnt] = prev_neigh_id;
+              distl[curr_neigh_cnt] = candidate_distances[i];
+              ++curr_neigh_cnt;
+              pruned_mask[i] = 1;
+              break;
+            }
+          }
+        }
+        __syncthreads();
+      }
+
+      if (threadIdx.x == 0) {
+        setListCount(linkl, curr_neigh_cnt);
+        state->reverse_edge_heads[head_offset] = kInvalidReverseEdge;
       }
       __syncthreads();
     }

@@ -256,7 +256,11 @@ class HierarchicalNswLite {
 #endif
     cuda_free_buffer(host_gpu_graph_state_.news_dist);
     cuda_free_buffer(host_gpu_graph_state_.news_rank);
-    cuda_free_buffer(host_gpu_graph_state_.frozen_link_counts);
+    cuda_free_buffer(host_gpu_graph_state_.reverse_edge_heads);
+    cuda_free_buffer(host_gpu_graph_state_.reverse_edge_sources);
+    cuda_free_buffer(host_gpu_graph_state_.reverse_edge_distances);
+    cuda_free_buffer(host_gpu_graph_state_.reverse_edge_next);
+    cuda_free_buffer(host_gpu_graph_state_.reverse_edge_counts);
     cuda_free_buffer(host_gpu_graph_state_.changed_old_links);
     cuda_free_buffer(host_gpu_graph_state_.changed_old_link_counts);
     cuda_free_buffer(host_gpu_graph_state_.old_vector_fetch_index);
@@ -1065,8 +1069,18 @@ class HierarchicalNswLite {
     gpuMemset(host_gpu_graph_state_.visited, 0, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
     gpuMalloc(&host_gpu_graph_state_.visited_tags, sizeof(uint32_t) * GRID_DIM);
     gpuMemset(host_gpu_graph_state_.visited_tags, 0, sizeof(uint32_t) * GRID_DIM);
-    gpuMalloc(&host_gpu_graph_state_.frozen_link_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
-    gpuMemset(host_gpu_graph_state_.frozen_link_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
+    gpuMalloc(&host_gpu_graph_state_.reverse_edge_heads, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
+    gpuMemset(
+        host_gpu_graph_state_.reverse_edge_heads, 0xff, sizeof(uint32_t) * MAX_HNSW_LEVEL * gpu_max_elements);
+    // Each new node contributes at most maxM0_ reverse edges on one level.
+    const size_t reverse_edge_capacity =
+        static_cast<size_t>(MAX_HNSW_LEVEL) * BATCHSZ_PER_NEW * maxM0_;
+    gpuMalloc(&host_gpu_graph_state_.reverse_edge_sources, sizeof(uint32_t) * reverse_edge_capacity);
+    gpuMalloc(&host_gpu_graph_state_.reverse_edge_distances, sizeof(float) * reverse_edge_capacity);
+    gpuMalloc(&host_gpu_graph_state_.reverse_edge_next, sizeof(uint32_t) * reverse_edge_capacity);
+    gpuMalloc(&host_gpu_graph_state_.reverse_edge_counts, sizeof(uint32_t) * MAX_HNSW_LEVEL);
+    gpuMemset(host_gpu_graph_state_.reverse_edge_counts, 0, sizeof(uint32_t) * MAX_HNSW_LEVEL);
+
     // There are at most BATCHSZ_PER_NEW * maxM0_ changed old links per level.
     gpuMalloc(
         &host_gpu_graph_state_.changed_old_links,
