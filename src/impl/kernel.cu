@@ -79,8 +79,7 @@ __device__ uint32_t *get_linklist(GpuGraphState *state, uint32_t internal_id, in
 }
 
 __device__ float *get_linklist_dist(GpuGraphState *state, uint32_t internal_id, int level) {
-  return (float *)(state->link_lists[internal_id] + (level - 1) * state->size_links_per_element +
-                   sizeof(linklistsizeint) + (state->M + REVERSE_HEADROOM) * sizeof(uint32_t));
+  return (float *)(state->link_lists_dist[internal_id] + (level - 1) * state->size_dists_per_element);
 }
 
 __device__ char *level0_link_bytes(GpuGraphState *state, uint32_t internal_id) {
@@ -93,8 +92,8 @@ __device__ uint32_t *get_linklist0(GpuGraphState *state, uint32_t internal_id) {
 }
 
 __device__ float *get_linklist_dist0(GpuGraphState *state, uint32_t internal_id) {
-  return (float *)(level0_link_bytes(state, internal_id) + sizeof(linklistsizeint) +
-                   (state->maxM0 + REVERSE_HEADROOM) * sizeof(uint32_t));
+  return (float *)(state->level0_dists +
+                   static_cast<size_t>(internal_id) * static_cast<size_t>(state->size_dists_level0));
 }
 
 __device__ uint32_t *get_level_linklist(GpuGraphState *state, uint32_t internal_id, int level) {

@@ -18,7 +18,8 @@ struct GpuGraphState {
   uint32_t max_elements{0};
   uint32_t cur_element_count{0};
   uint32_t size_data_per_element{0};
-  uint32_t size_links_per_element{0};  // TODO: M + the batch size of new vectors
+  uint32_t size_links_per_element{0};  // count + (M + REVERSE_HEADROOM) ids
+  uint32_t size_dists_per_element{0};  // (M + REVERSE_HEADROOM) floats
   uint32_t M{0};
   // uint32_t maxM{0};
   uint32_t maxM0{0};
@@ -26,6 +27,7 @@ struct GpuGraphState {
   uint32_t ef{0};
   uint32_t enterpoint_node{kInvalidGpuOffset};
   uint32_t size_links_level0{0};
+  uint32_t size_dists_level0{0};
   uint32_t offsetData{0};
   uint32_t offsetLevel0{0};
   uint32_t label_offset{0};
@@ -43,9 +45,12 @@ struct GpuGraphState {
   // to be updated after construction
   uint32_t link_lists_bytes{0};
   char *level0_links{nullptr};
+  char *level0_dists{nullptr};
   half *half_vector_data{nullptr};
   char **link_lists{nullptr};
-  float *neighbor_distances{nullptr};
+  char **link_lists_dist{nullptr};
+  char *upper_links{nullptr};
+  char *upper_dists{nullptr};
   uint32_t *element_levels{nullptr};
   // runtime states shared by all threads on GPU
   // no need to maintain on CPU

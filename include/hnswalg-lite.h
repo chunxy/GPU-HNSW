@@ -86,6 +86,7 @@ class HierarchicalNswLite {
 
   char *data_level0_memory_{nullptr};
   char **linkLists_{nullptr};
+  char *link_lists_memory_{nullptr};
   std::vector<int> element_levels_;
 
   size_t data_size_{0};
@@ -227,8 +228,13 @@ class HierarchicalNswLite {
     release_gpu_state();
     free(data_level0_memory_);
     data_level0_memory_ = nullptr;
-    for (tableint i = 0; i < cur_element_count; i++) {
-      if (element_levels_[i] > 0) free(linkLists_[i]);
+    if (link_lists_memory_ != nullptr) {
+      free(link_lists_memory_);
+      link_lists_memory_ = nullptr;
+    } else {
+      for (tableint i = 0; i < cur_element_count; i++) {
+        if (element_levels_[i] > 0) free(linkLists_[i]);
+      }
     }
     free(linkLists_);
     linkLists_ = nullptr;
@@ -254,6 +260,10 @@ class HierarchicalNswLite {
     cuda_free_buffer(host_gpu_graph_state_.search_block_prune_cycles);
     cuda_free_buffer(host_gpu_graph_state_.search_block_expands);
 #endif
+    cuda_free_buffer(host_gpu_graph_state_.level0_dists);
+    cuda_free_buffer(host_gpu_graph_state_.link_lists_dist);
+    cuda_free_buffer(host_gpu_graph_state_.upper_links);
+    cuda_free_buffer(host_gpu_graph_state_.upper_dists);
     cuda_free_buffer(host_gpu_graph_state_.news_dist);
     cuda_free_buffer(host_gpu_graph_state_.news_rank);
     cuda_free_buffer(host_gpu_graph_state_.reverse_edge_heads);
@@ -1027,9 +1037,11 @@ class HierarchicalNswLite {
     }
 
     const uint32_t gpu_size_links_level0 =
-        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (maxM0_ + REVERSE_HEADROOM) * 2);
+        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (maxM0_ + REVERSE_HEADROOM));
     const uint32_t gpu_size_links_per_element =
-        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (M_ + REVERSE_HEADROOM) * 2);
+        checked_u32(sizeof(linklistsizeint) + sizeof(tableint) * (M_ + REVERSE_HEADROOM));
+    const uint32_t gpu_size_dists_level0 = checked_u32(sizeof(float) * (maxM0_ + REVERSE_HEADROOM));
+    const uint32_t gpu_size_dists_per_element = checked_u32(sizeof(float) * (M_ + REVERSE_HEADROOM));
 
     host_gpu_graph_state_.max_elements = gpu_max_elements;
     host_gpu_graph_state_.cur_element_count = checked_u32(cur_element_count.load());
@@ -1042,6 +1054,8 @@ class HierarchicalNswLite {
     host_gpu_graph_state_.maxM0 = checked_u32(maxM0_);
     host_gpu_graph_state_.size_links_level0 = gpu_size_links_level0;
     host_gpu_graph_state_.size_links_per_element = gpu_size_links_per_element;
+    host_gpu_graph_state_.size_dists_level0 = gpu_size_dists_level0;
+    host_gpu_graph_state_.size_dists_per_element = gpu_size_dists_per_element;
     host_gpu_graph_state_.offsetData = checked_u32(offsetData_);
     host_gpu_graph_state_.offsetLevel0 = checked_u32(offsetLevel0_);
     host_gpu_graph_state_.label_offset = checked_u32(label_offset_);
@@ -1055,6 +1069,9 @@ class HierarchicalNswLite {
     const size_t gpu_level0_bytes = static_cast<size_t>(gpu_max_elements) * gpu_size_links_level0;
     gpuMalloc(&host_gpu_graph_state_.level0_links, gpu_level0_bytes);
     gpuMemset(host_gpu_graph_state_.level0_links, 0, gpu_level0_bytes);
+    const size_t gpu_level0_dist_bytes = static_cast<size_t>(gpu_max_elements) * gpu_size_dists_level0;
+    gpuMalloc(&host_gpu_graph_state_.level0_dists, gpu_level0_dist_bytes);
+    gpuMemset(host_gpu_graph_state_.level0_dists, 0, gpu_level0_dist_bytes);
     gpuMalloc(&host_gpu_graph_state_.level_counts, sizeof(uint32_t) * gpu_max_elements);
     gpuMemset(host_gpu_graph_state_.level_counts, 0, sizeof(uint32_t) * gpu_max_elements);
     gpuMalloc(&host_gpu_graph_state_.element_levels, sizeof(uint32_t) * gpu_max_elements);
@@ -1065,6 +1082,8 @@ class HierarchicalNswLite {
     gpuMalloc(&host_gpu_graph_state_.old_vector_level_delimiter, sizeof(uint32_t) * MAX_HNSW_LEVEL);
     gpuMalloc(&host_gpu_graph_state_.link_lists, sizeof(char *) * gpu_max_elements);
     gpuMemset(host_gpu_graph_state_.link_lists, 0, sizeof(char *) * gpu_max_elements);
+    gpuMalloc(&host_gpu_graph_state_.link_lists_dist, sizeof(char *) * gpu_max_elements);
+    gpuMemset(host_gpu_graph_state_.link_lists_dist, 0, sizeof(char *) * gpu_max_elements);
     gpuMalloc(&host_gpu_graph_state_.visited, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
     gpuMemset(host_gpu_graph_state_.visited, 0, sizeof(uint32_t) * gpu_max_elements * GRID_DIM);
     gpuMalloc(&host_gpu_graph_state_.visited_tags, sizeof(uint32_t) * GRID_DIM);
@@ -1159,43 +1178,46 @@ class HierarchicalNswLite {
       }
     }
 
-    std::vector<char *> device_link_lists(max_elements_, nullptr);
-    CUDA_CHECK(cudaMemcpy(
-        device_link_lists.data(),
-        host_gpu_graph_state_.link_lists,
-        sizeof(char *) * max_elements_,
-        cudaMemcpyDeviceToHost));
-
-    auto copy_gpu_linklist = [&](void *cpu_ll, const char *gpu_ll, size_t cpu_capacity) {
-      uint32_t gpu_count = 0;
-      CUDA_CHECK(cudaMemcpy(&gpu_count, gpu_ll, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-      memset(cpu_ll, 0, sizeof(linklistsizeint) + sizeof(tableint) * cpu_capacity);
-      setListCount(static_cast<linklistsizeint *>(cpu_ll), static_cast<unsigned short int>(gpu_count));
-      if (gpu_count == 0) {
-        return;
+    if (link_lists_memory_ != nullptr) {
+      free(link_lists_memory_);
+      link_lists_memory_ = nullptr;
+    } else if (linkLists_ != nullptr) {
+      for (size_t i = 0; i < max_elements_; ++i) {
+        if (linkLists_[i] != nullptr) {
+          free(linkLists_[i]);
+        }
       }
+    }
+    for (size_t i = 0; i < max_elements_; ++i) {
+      linkLists_[i] = nullptr;
+    }
 
-      // GPU layout is: count, ids with reverse-edge headroom, then distances.
-      // CPU layout is: count, ids. Copy the ids explicitly and skip GPU distances.
-      tableint *cpu_ids = reinterpret_cast<tableint *>(static_cast<linklistsizeint *>(cpu_ll) + 1);
-      CUDA_CHECK(
-          cudaMemcpy(cpu_ids, gpu_ll + sizeof(linklistsizeint), sizeof(tableint) * gpu_count, cudaMemcpyDeviceToHost));
-    };
+    const uint32_t gpu_l0_stride = host_gpu_graph_state_.size_links_level0;
+    const size_t l0_bytes = cur_count * static_cast<size_t>(gpu_l0_stride);
+    std::vector<char> level0_ids(l0_bytes);
+    CUDA_CHECK(
+        cudaMemcpy(level0_ids.data(), host_gpu_graph_state_.level0_links, l0_bytes, cudaMemcpyDeviceToHost));
+
+    const size_t upper_bytes = host_gpu_graph_state_.link_lists_bytes;
+    if (upper_bytes > 0) {
+      link_lists_memory_ = (char *)malloc(upper_bytes);
+      CUDA_CHECK(cudaMemcpy(
+          link_lists_memory_, host_gpu_graph_state_.upper_links, upper_bytes, cudaMemcpyDeviceToHost));
+      char *cursor = link_lists_memory_;
+      for (size_t i = 0; i < max_elements_; ++i) {
+        const int level = element_levels_[i];
+        if (level <= 0) {
+          continue;
+        }
+        linkLists_[i] = cursor;
+        cursor += static_cast<size_t>(level) * size_links_per_element_;
+      }
+    }
 
     label_lookup_.clear();
     for (size_t i = 0; i < cur_count; ++i) {
-      if (linkLists_[i] != nullptr) {
-        free(linkLists_[i]);
-        linkLists_[i] = nullptr;
-      }
-
       memset(data_level0_memory_ + i * size_data_per_element_, 0, size_data_per_element_);
-
-      copy_gpu_linklist(
-          get_linklist0(i),
-          host_gpu_graph_state_.level0_links + i * static_cast<size_t>(host_gpu_graph_state_.size_links_level0),
-          maxM0_);
+      memcpy(get_linklist0(i), level0_ids.data() + i * gpu_l0_stride, size_links_level0_);
 
       CUDA_CHECK(cudaMemcpy(
           getDataByInternalId(i),
@@ -1206,33 +1228,6 @@ class HierarchicalNswLite {
       const labeltype label = i;
       setExternalLabel(i, label);
       label_lookup_[label] = i;
-
-      const int level = element_levels_[i];
-      if (level <= 0) {
-        linkLists_[i] = nullptr;
-        continue;
-      }
-
-      const size_t cpu_link_list_bytes = size_links_per_element_ * level;
-      linkLists_[i] = (char *)malloc(cpu_link_list_bytes);
-      memset(linkLists_[i], 0, cpu_link_list_bytes);
-
-      for (int lv = 1; lv <= level; ++lv) {
-        if (device_link_lists[i] == nullptr) {
-          throw std::runtime_error("copy_from_gpu found a null GPU upper-layer link list");
-        }
-        copy_gpu_linklist(
-            linkLists_[i] + (lv - 1) * size_links_per_element_,
-            device_link_lists[i] + (lv - 1) * host_gpu_graph_state_.size_links_per_element,
-            maxM_);
-      }
-    }
-
-    for (size_t i = cur_count; i < max_elements_; ++i) {
-      if (linkLists_[i] != nullptr) {
-        free(linkLists_[i]);
-      }
-      linkLists_[i] = nullptr;
     }
   }
 
@@ -1269,16 +1264,57 @@ class HierarchicalNswLite {
         sizeof(int32_t) * element_levels_.size(),
         cudaMemcpyDeviceToHost));
 
-    std::vector<char *> link_lists(max_elements_);
+    size_t total_upper_levels = 0;
     for (size_t i = 0; i < max_elements_; ++i) {
-      const size_t sz =
-          static_cast<size_t>(host_gpu_graph_state_.size_links_per_element) * static_cast<size_t>(element_levels_[i]);
-      gpuMalloc(&link_lists[i], sz);
-      gpuMemset(link_lists[i], 0, sz);
+      total_upper_levels += static_cast<size_t>(element_levels_[i]);
+    }
+    const size_t upper_id_bytes =
+        total_upper_levels * static_cast<size_t>(host_gpu_graph_state_.size_links_per_element);
+    const size_t upper_dist_bytes =
+        total_upper_levels * static_cast<size_t>(host_gpu_graph_state_.size_dists_per_element);
+    host_gpu_graph_state_.link_lists_bytes = checked_u32(upper_id_bytes);
+
+    if (upper_id_bytes > 0) {
+      gpuMalloc(&host_gpu_graph_state_.upper_links, upper_id_bytes);
+      gpuMemset(host_gpu_graph_state_.upper_links, 0, upper_id_bytes);
+    }
+    if (upper_dist_bytes > 0) {
+      gpuMalloc(&host_gpu_graph_state_.upper_dists, upper_dist_bytes);
+      gpuMemset(host_gpu_graph_state_.upper_dists, 0, upper_dist_bytes);
+    }
+
+    std::vector<char *> link_lists(max_elements_, nullptr);
+    std::vector<char *> link_lists_dist(max_elements_, nullptr);
+    char *id_cursor = host_gpu_graph_state_.upper_links;
+    char *dist_cursor = host_gpu_graph_state_.upper_dists;
+    for (size_t i = 0; i < max_elements_; ++i) {
+      const size_t level = static_cast<size_t>(element_levels_[i]);
+      if (level == 0) {
+        continue;
+      }
+      link_lists[i] = id_cursor;
+      link_lists_dist[i] = dist_cursor;
+      id_cursor += level * static_cast<size_t>(host_gpu_graph_state_.size_links_per_element);
+      dist_cursor += level * static_cast<size_t>(host_gpu_graph_state_.size_dists_per_element);
     }
 
     CUDA_CHECK(cudaMemcpy(
         host_gpu_graph_state_.link_lists, link_lists.data(), sizeof(char *) * max_elements_, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        host_gpu_graph_state_.link_lists_dist,
+        link_lists_dist.data(),
+        sizeof(char *) * max_elements_,
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        reinterpret_cast<char *>(device_gpu_graph_state_) + offsetof(GpuGraphState, upper_links),
+        &host_gpu_graph_state_.upper_links,
+        sizeof(char *) * 2,
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        reinterpret_cast<char *>(device_gpu_graph_state_) + offsetof(GpuGraphState, link_lists_bytes),
+        &host_gpu_graph_state_.link_lists_bytes,
+        sizeof(uint32_t),
+        cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaEventRecord(ev_alloc_end));
     CUDA_CHECK(cudaEventSynchronize(ev_alloc_end));
     float ms_alloc = 0.0f;
