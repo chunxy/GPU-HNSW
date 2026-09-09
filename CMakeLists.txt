@@ -1,4 +1,9 @@
-cmake_minimum_required(VERSION 3.17)
+cmake_minimum_required(VERSION 3.18)
+
+# WMMA/Tensor Cores require SM 7.0+. Must be set before project() so nvcc uses it.
+set(CMAKE_CUDA_ARCHITECTURES "86;89;90" CACHE STRING
+    "CUDA architectures (WMMA requires >= 70)")
+
 project(GpuHnsw LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)
 
@@ -14,12 +19,9 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 endif()
-set(CUDAToolkit_ROOT "/usr/local/cuda-12.3/")
-# "native" can fail under some environments (e.g. WSL/sandboxed builds) and
-# silently fall back to an older default arch that does not support WMMA.
-# Build fatbins for common Tensor Core-capable architectures instead.
-# set(CMAKE_CUDA_ARCHITECTURES 75 80 86)
-set(CMAKE_CUDA_ARCHITECTURES native)
+# Finds the toolkit that belongs to CMAKE_CUDA_COMPILER (the nvcc used by
+# project()). Override only if that guess is wrong:
+#   cmake -DCUDAToolkit_ROOT=/usr/local/cuda-12.3
 find_package(CUDAToolkit REQUIRED)
 find_package(fmt REQUIRED)
 include(CTest)
