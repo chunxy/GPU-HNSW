@@ -6,7 +6,7 @@
 const float EPSILON = 1e-3;
 
 // directories
-const std::string WORKSPACE = "/home/sean/GpuHnsw";
+const std::string WORKSPACE = "./";
 const std::string LOGS = WORKSPACE + "/logs";
 const std::string CKPS = WORKSPACE + "/checkpoints";
 const std::string STATS = WORKSPACE + "/stats";
